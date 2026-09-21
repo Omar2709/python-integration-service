@@ -17,13 +17,21 @@ class VendorClient:
             raise ConfigurationError("base_url is required and cannot be empty")
         if not access_token:
             raise ConfigurationError("access_token is required and cannot be empty")
-        if timeout <= 0:
-            raise ConfigurationError(f"timeout must be greater than 0, got {timeout}")
 
         self.base_url: str = base_url
-        self.access_token: str = access_token
+        self._access_token: str = access_token
         self.transport: Transport = transport
-        self.timeout: float = timeout
+        self.timeout = timeout
+
+    @property
+    def timeout(self) -> float:
+        return self._timeout
+
+    @timeout.setter
+    def timeout(self, value: float) -> None:
+        if value <= 0:
+            raise ConfigurationError(f"timeout must be greater than 0, got {value}")
+        self._timeout = value
 
     def build_url(self, path: str) -> str:
         base = self.base_url.rstrip("/")
