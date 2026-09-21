@@ -2,10 +2,17 @@ import os
 from urllib.parse import urlparse
 
 from python_integration_service.integrations.exceptions import ConfigurationError
+from python_integration_service.integrations.transport import Transport
 
 
 class VendorClient:
-    def __init__(self, base_url: str, access_token: str, timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        access_token: str,
+        transport: Transport,
+        timeout: float = 30.0,
+    ) -> None:
         if not base_url:
             raise ConfigurationError("base_url is required and cannot be empty")
         if not access_token:
@@ -15,6 +22,7 @@ class VendorClient:
 
         self.base_url: str = base_url
         self.access_token: str = access_token
+        self.transport: Transport = transport
         self.timeout: float = timeout
 
     def build_url(self, path: str) -> str:
@@ -22,8 +30,12 @@ class VendorClient:
         endpoint = path.lstrip("/")
         return f"{base}/{endpoint}"
 
+    def get(self, path: str) -> dict:
+        url = self.build_url(path)
+        return self.transport.get(url)
+
     @classmethod
-    def from_env(cls) -> "VendorClient":
+    def from_env(cls, transport: Transport) -> "VendorClient":
         base_url = os.getenv("VENDOR_BASE_URL")
         if not base_url:
             raise ConfigurationError("Missing environment variable: VENDOR_BASE_URL")
@@ -42,7 +54,12 @@ class VendorClient:
                 f"Invalid VENDOR_TIMEOUT value '{raw_timeout}'. Must be a valid number."
             ) from err
 
-        return cls(base_url=base_url, access_token=access_token, timeout=timeout)
+        return cls(
+            base_url=base_url,
+            access_token=access_token,
+            transport=transport,
+            timeout=timeout,
+        )
 
     @staticmethod
     def is_valid_url(value: object) -> bool:
