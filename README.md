@@ -8,33 +8,34 @@ The project focuses on designing integrations that are explicit, testable, maint
 
 The main goals of this project are to practice and demonstrate:
 
-- Clean Python design and object-oriented programming.
-- Dependency inversion and transport abstractions.
-- Custom exception hierarchies for external integrations.
-- Configurable retry mechanisms.
-- Iterators, generators, and lazy pagination.
-- REST API integrations.
-- Authentication and secure configuration using environment variables.
-- Data validation and transformation.
-- Testing with `pytest`.
-- Mocks, fixtures, and coverage.
-- Resilience patterns such as backoff, jitter, timeouts, and rate-limit handling.
-- Docker and CI/CD.
-- Cloud-oriented integration architecture.
-- Basic Kubernetes deployment concepts.
-- Security concepts relevant to backend integrations.
+* Clean Python design and object-oriented programming.
+* Dependency inversion and transport abstractions.
+* Custom exception hierarchies for external integrations.
+* Configurable retry mechanisms.
+* Iterators, generators, and lazy pagination.
+* Context managers and deterministic resource cleanup.
+* REST API integrations.
+* Authentication and secure configuration using environment variables.
+* Data validation and transformation.
+* Testing with `pytest`.
+* Mocks, fixtures, and coverage.
+* Resilience patterns such as backoff, jitter, timeouts, and rate-limit handling.
+* Docker and CI/CD.
+* Cloud-oriented integration architecture.
+* Basic Kubernetes deployment concepts.
+* Security concepts relevant to backend integrations.
 
 ## Tech Stack
 
-- Python 3.13+
-- FastAPI
-- HTTPX
-- Pydantic Settings
-- Uvicorn
-- pytest
-- pytest-cov
-- Ruff
-- uv
+* Python 3.13+
+* FastAPI
+* HTTPX
+* Pydantic Settings
+* Uvicorn
+* pytest
+* pytest-cov
+* Ruff
+* uv
 
 ## Project Structure
 
@@ -47,22 +48,29 @@ python-integration-service/
 │       └── integrations/
 │           ├── __init__.py
 │           ├── exceptions.py
+│           ├── managed_resource.py
 │           ├── page_iterator.py
 │           ├── pagination.py
+│           ├── resource_context.py
 │           ├── retry.py
 │           ├── transport.py
 │           └── vendor_client.py
 ├── tests/
 │   └── integrations/
+│       ├── test_managed_resource.py
 │       ├── test_page_iterator.py
 │       ├── test_pagination.py
+│       ├── test_resource_context.py
 │       └── test_retry.py
 ├── .env.example
 ├── .gitignore
+├── .python-version
 ├── pyproject.toml
 ├── uv.lock
 └── README.md
 ```
+
+Generated local directories such as `.venv/`, `.pytest_cache/`, `.ruff_cache/`, and `__pycache__/` are intentionally omitted from the project structure.
 
 ## Current Implementation
 
@@ -82,11 +90,11 @@ Custom exceptions provide a clear domain boundary for integration failures.
 
 Current exception types include:
 
-- `IntegrationError`
-- `ConfigurationError`
-- `AuthenticationError`
-- `RateLimitError`
-- `TransientIntegrationError`
+* `IntegrationError`
+* `ConfigurationError`
+* `AuthenticationError`
+* `RateLimitError`
+* `TransientIntegrationError`
 
 This allows higher-level application code to distinguish integration-specific errors from unrelated programming errors.
 
@@ -114,13 +122,13 @@ This follows the Dependency Inversion Principle and makes the integration client
 
 `VendorClient` currently provides:
 
-- Base URL configuration.
-- Access-token configuration.
-- Timeout validation.
-- Environment-based construction with `from_env`.
-- URL construction.
-- URL validation.
-- Delegation of outbound requests to a `Transport`.
+* Base URL configuration.
+* Access-token configuration.
+* Timeout validation.
+* Environment-based construction with `from_env`.
+* URL construction.
+* URL validation.
+* Delegation of outbound requests to a `Transport`.
 
 Secrets such as access tokens are expected to come from environment variables and must not be hardcoded or logged.
 
@@ -135,16 +143,17 @@ Example:
     max_attempts=3,
     retry_on=(TimeoutError, ConnectionError),
 )
-def call_vendor(): ...
+def call_vendor():
+    ...
 ```
 
 Current behavior:
 
-- Validates that `max_attempts` is greater than zero.
-- Retries only explicitly configured exception types.
-- Immediately propagates non-retryable exceptions.
-- Re-raises the final retryable exception after attempts are exhausted.
-- Preserves function metadata using `functools.wraps`.
+* Validates that `max_attempts` is greater than zero.
+* Retries only explicitly configured exception types.
+* Immediately propagates non-retryable exceptions.
+* Re-raises the final retryable exception after attempts are exhausted.
+* Preserves function metadata using `functools.wraps`.
 
 Backoff, jitter, logging, and `Retry-After` support are intentionally deferred to a later resilience phase.
 
@@ -167,31 +176,58 @@ __next__()
 
 It demonstrates the mechanics that Python generators normally manage automatically:
 
-- Current page state.
-- Current item position.
-- Empty-page handling.
-- `StopIteration`.
+* Current page state.
+* Current item position.
+* Empty-page handling.
+* `StopIteration`.
+
+### Context managers
+
+The project includes examples of both class-based and generator-based context managers.
+
+`ManagedResource` demonstrates the context manager protocol through:
+
+* `__enter__`
+* `__exit__`
+* Resource setup and cleanup.
+* Cleanup even when exceptions occur.
+* Explicit exception propagation.
+
+`managed_resource` demonstrates the same lifecycle using `contextlib.contextmanager` and `try/finally`.
+
+This illustrates how context managers provide deterministic resource cleanup for files, HTTP clients, database connections, locks, and similar resources.
 
 ## Tests
 
 The current test suite covers:
 
-- Retry success on the first attempt.
-- Retry after transient failures.
-- Immediate propagation of non-retryable exceptions.
-- Exhausted retry attempts.
-- Invalid retry configuration.
-- Preservation of decorated function metadata.
-- Generator behavior across multiple pages.
-- Empty pagination scenarios.
-- Manual iterator behavior.
-- Iterator exhaustion with `StopIteration`.
-- Iterator identity.
+* Retry success on the first attempt.
+* Retry after transient failures.
+* Immediate propagation of non-retryable exceptions.
+* Exhausted retry attempts.
+* Invalid retry configuration.
+* Preservation of decorated function metadata.
+* Generator behavior across multiple pages.
+* Empty pagination scenarios.
+* Manual iterator behavior.
+* Iterator exhaustion with `StopIteration`.
+* Iterator identity.
+* Class-based context manager lifecycle.
+* Cleanup after normal context exit.
+* Cleanup when exceptions occur.
+* Exception propagation from context managers.
+* Generator-based context managers with `contextlib.contextmanager`.
 
 Current test count:
 
 ```text
-15 tests
+23 tests
+```
+
+The current suite passes successfully:
+
+```text
+23 passed
 ```
 
 Run the suite with:
@@ -214,6 +250,12 @@ Run lint checks:
 uv run ruff check .
 ```
 
+Check formatting without modifying files:
+
+```bash
+uv run ruff format --check .
+```
+
 Run tests:
 
 ```bash
@@ -230,8 +272,8 @@ uv run pytest --cov=python_integration_service --cov-report=term-missing
 
 ### Requirements
 
-- Python 3.13 or newer
-- `uv`
+* Python 3.13 or newer
+* `uv`
 
 Clone the repository:
 
@@ -282,17 +324,18 @@ The expected result is a successful health response from the application.
 
 The project follows several principles that will guide future changes:
 
-- Prefer composition over unnecessary inheritance.
-- Depend on abstractions at integration boundaries.
-- Keep responsibilities small and explicit.
-- Retry only failures that are actually retryable.
-- Never silently swallow exceptions.
-- Preserve original exceptions and tracebacks when possible.
-- Avoid hardcoding credentials.
-- Validate configuration early.
-- Prefer lazy processing when large datasets do not need to be fully loaded into memory.
-- Write tests around observable behavior rather than implementation details.
-- Keep integrations replaceable and easy to isolate in tests.
+* Prefer composition over unnecessary inheritance.
+* Depend on abstractions at integration boundaries.
+* Keep responsibilities small and explicit.
+* Retry only failures that are actually retryable.
+* Never silently swallow exceptions.
+* Preserve original exceptions and tracebacks when possible.
+* Avoid hardcoding credentials.
+* Validate configuration early.
+* Prefer lazy processing when large datasets do not need to be fully loaded into memory.
+* Use context managers for deterministic cleanup of managed resources.
+* Write tests around observable behavior rather than implementation details.
+* Keep integrations replaceable and easy to isolate in tests.
 
 ## Roadmap
 
@@ -300,37 +343,38 @@ The project will evolve incrementally.
 
 ### Completed
 
-- [x] Initial FastAPI application.
-- [x] Integration exception hierarchy.
-- [x] Transport abstraction.
-- [x] Vendor client foundation.
-- [x] Environment-based client configuration.
-- [x] Configurable retry decorator.
-- [x] Retry behavior tests.
-- [x] Generator fundamentals.
-- [x] Manual iterator implementation.
-- [x] Pagination and iterator tests.
+* [x] Initial FastAPI application.
+* [x] Integration exception hierarchy.
+* [x] Transport abstraction.
+* [x] Vendor client foundation.
+* [x] Environment-based client configuration.
+* [x] Configurable retry decorator.
+* [x] Retry behavior tests.
+* [x] Generator fundamentals.
+* [x] Manual iterator implementation.
+* [x] Pagination and iterator tests.
+* [x] Context manager protocol with `__enter__` and `__exit__`.
+* [x] Generator-based context managers with `contextlib.contextmanager`.
 
 ### Next
 
-- [ ] Apply lazy iteration to a real paginated client flow.
-- [ ] Context managers.
-- [ ] Concrete HTTPX transport.
-- [ ] REST integration behavior.
-- [ ] Authentication flows.
-- [ ] Data transformation and validation.
-- [ ] Advanced pytest fixtures and mocks.
-- [ ] Coverage reporting.
-- [ ] Retry backoff and jitter.
-- [ ] HTTP `429` and `Retry-After`.
-- [ ] Rate limiting.
-- [ ] GraphQL integration.
-- [ ] gRPC integration.
-- [ ] Docker.
-- [ ] CI/CD.
-- [ ] AWS-oriented integration architecture.
-- [ ] Kubernetes fundamentals.
-- [ ] Security and dependency-vulnerability practices.
+* [ ] Apply lazy iteration to a real paginated client flow.
+* [ ] Concrete HTTPX transport.
+* [ ] REST integration behavior.
+* [ ] Authentication flows.
+* [ ] Data transformation and validation.
+* [ ] Advanced pytest fixtures and mocks.
+* [ ] Coverage reporting.
+* [ ] Retry backoff and jitter.
+* [ ] HTTP `429` and `Retry-After`.
+* [ ] Rate limiting.
+* [ ] GraphQL integration.
+* [ ] gRPC integration.
+* [ ] Docker.
+* [ ] CI/CD.
+* [ ] AWS-oriented integration architecture.
+* [ ] Kubernetes fundamentals.
+* [ ] Security and dependency-vulnerability practices.
 
 ## Status
 
