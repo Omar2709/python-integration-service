@@ -23,7 +23,8 @@ The main goals of this project are to practice and demonstrate:
 * Testing with `pytest`.
 * Mocks, fixtures, and coverage.
 * Resilience patterns such as backoff, jitter, timeouts, and rate-limit handling.
-* Docker and CI/CD.
+* Continuous integration with GitHub Actions.
+* Docker and continuous deployment.
 * Cloud-oriented integration architecture.
 * Basic Kubernetes deployment concepts.
 * Security concepts relevant to backend integrations.
@@ -39,11 +40,15 @@ The main goals of this project are to practice and demonstrate:
 * pytest-cov
 * Ruff
 * uv
+* GitHub Actions
 
 ## Project Structure
 
 ```text
 python-integration-service/
+├── .github/
+│   └── workflows/
+│       └── ci.yml
 ├── src/
 │   └── python_integration_service/
 │       ├── __init__.py
@@ -75,7 +80,9 @@ python-integration-service/
 └── README.md
 ```
 
-Generated local directories such as `.venv/`, `.pytest_cache/`, `.ruff_cache/`, `__pycache__/`, and local editor configuration such as `.vscode/` are intentionally omitted from the project structure.
+Generated local directories and files such as `.venv/`, `.pytest_cache/`, `.ruff_cache/`, `__pycache__/`, `.coverage`, `coverage.xml`, and `junit.xml` are intentionally omitted from the project structure.
+
+Local editor configuration such as `.vscode/` is also intentionally kept outside the repository.
 
 ## Current Implementation
 
@@ -346,6 +353,51 @@ Run tests with coverage:
 uv run pytest --cov=python_integration_service --cov-report=term-missing
 ```
 
+## Continuous Integration
+
+GitHub Actions runs the project's quality checks automatically on:
+
+* Pushes to `main`.
+* Pull requests targeting `main`.
+* Manual workflow executions.
+
+The CI pipeline:
+
+* Sets up the project Python version.
+* Installs `uv`.
+* Installs dependencies from the committed lockfile.
+* Verifies formatting with Ruff.
+* Runs Ruff lint checks.
+* Executes the pytest suite.
+* Generates code coverage reports.
+* Generates JUnit XML test reports.
+* Uploads test reports as GitHub Actions artifacts.
+
+Conceptually:
+
+```text
+Push / Pull Request / Manual Run
+              |
+              v
+        GitHub Actions
+              |
+      +-------+-------+
+      |       |       |
+      v       v       v
+   Format    Lint    Tests
+    Ruff     Ruff    pytest
+                      |
+                      +--> Coverage report
+                      |
+                      +--> JUnit report
+                      |
+                      +--> GitHub Actions artifacts
+```
+
+Generated reports such as `.coverage`, `coverage.xml`, and `junit.xml` are build artifacts and are not intended to be committed to the repository.
+
+Continuous integration verifies changes automatically. Continuous deployment is intentionally not implemented yet because the project does not currently define a deployment target.
+
 ## Installation
 
 ### Requirements
@@ -417,6 +469,7 @@ The project follows several principles that will guide future changes:
 * Use context managers for deterministic cleanup of managed resources.
 * Write tests around observable behavior rather than implementation details.
 * Use HTTPX `MockTransport` to test HTTP behavior without real network calls.
+* Automate repeatable quality checks through continuous integration.
 * Keep integrations replaceable and easy to isolate in tests.
 
 ## Roadmap
@@ -444,19 +497,23 @@ The project will evolve incrementally.
 * [x] Rate-limit handling with `Retry-After`.
 * [x] Transient error classification for `500`, `502`, `503`, and `504`.
 * [x] `MockTransport`-based HTTP tests.
+* [x] GitHub Actions continuous integration.
+* [x] Automated Ruff format verification.
+* [x] Automated Ruff lint checks.
+* [x] Automated pytest execution.
+* [x] Coverage and JUnit report generation in CI.
 
 ### Next
 
 * [ ] Apply lazy iteration to a real paginated client flow.
 * [ ] Data transformation and validation.
 * [ ] Advanced pytest fixtures and mocks.
-* [ ] Coverage reporting.
 * [ ] Retry backoff and jitter.
 * [ ] Client-side rate limiting.
 * [ ] GraphQL integration.
 * [ ] gRPC integration.
 * [ ] Docker.
-* [ ] CI/CD.
+* [ ] Continuous deployment.
 * [ ] AWS-oriented integration architecture.
 * [ ] Kubernetes fundamentals.
 * [ ] Security and dependency-vulnerability practices.
@@ -467,4 +524,4 @@ This repository is under active development and is intentionally built in small,
 
 Each phase adds a focused backend concept together with tests before moving to the next topic.
 
-The current implementation includes a concrete HTTPX transport layer with authentication, HTTP error translation, timeout and network failure handling, rate-limit awareness, and isolated HTTP tests without real network access.
+The current implementation includes a concrete HTTPX transport layer with authentication, HTTP error translation, timeout and network failure handling, rate-limit awareness, isolated HTTP tests without real network access, and a GitHub Actions CI pipeline that automatically verifies formatting, linting, tests, coverage, and test reports.
