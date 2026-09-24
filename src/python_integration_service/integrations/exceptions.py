@@ -13,6 +13,14 @@ class AuthenticationError(IntegrationError):
 class RateLimitError(IntegrationError):
     """Raised when the provider rate limit is exceeded."""
 
+    def __init__(
+        self,
+        message: str,
+        retry_after: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
 
 class TransientIntegrationError(IntegrationError):
     """Raised for temporary integration failures."""

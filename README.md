@@ -15,7 +15,10 @@ The main goals of this project are to practice and demonstrate:
 * Iterators, generators, and lazy pagination.
 * Context managers and deterministic resource cleanup.
 * REST API integrations.
+* HTTP transport with HTTPX.
 * Authentication and secure configuration using environment variables.
+* HTTP error translation and transient failure classification.
+* Rate-limit handling.
 * Data validation and transformation.
 * Testing with `pytest`.
 * Mocks, fixtures, and coverage.
@@ -48,6 +51,7 @@ python-integration-service/
 │       └── integrations/
 │           ├── __init__.py
 │           ├── exceptions.py
+│           ├── httpx_transport.py
 │           ├── managed_resource.py
 │           ├── page_iterator.py
 │           ├── pagination.py
@@ -57,6 +61,7 @@ python-integration-service/
 │           └── vendor_client.py
 ├── tests/
 │   └── integrations/
+│       ├── test_httpx_transport.py
 │       ├── test_managed_resource.py
 │       ├── test_page_iterator.py
 │       ├── test_pagination.py
@@ -70,7 +75,7 @@ python-integration-service/
 └── README.md
 ```
 
-Generated local directories such as `.venv/`, `.pytest_cache/`, `.ruff_cache/`, and `__pycache__/` are intentionally omitted from the project structure.
+Generated local directories such as `.venv/`, `.pytest_cache/`, `.ruff_cache/`, `__pycache__/`, and local editor configuration such as `.vscode/` are intentionally omitted from the project structure.
 
 ## Current Implementation
 
@@ -96,7 +101,7 @@ Current exception types include:
 * `RateLimitError`
 * `TransientIntegrationError`
 
-This allows higher-level application code to distinguish integration-specific errors from unrelated programming errors.
+This allows higher-level application code to distinguish integration-specific failures from unrelated programming errors.
 
 ### Transport abstraction
 
@@ -113,10 +118,31 @@ VendorClient
 Transport
     |
     +-- FakeTransport
-    +-- future HttpxTransport
+    +-- HttpxTransport
 ```
 
-This follows the Dependency Inversion Principle and makes the integration client easier to test.
+This follows the Dependency Inversion Principle and makes the integration client easier to test while allowing the concrete HTTP implementation to be replaced independently.
+
+### HTTPX transport
+
+The project includes a concrete HTTP transport implemented with `httpx.Client`.
+
+`HttpxTransport` is responsible for performing outbound HTTP requests while keeping HTTP-specific behavior behind the `Transport` abstraction.
+
+Current behavior includes:
+
+* Outbound requests through `httpx.Client`.
+* Bearer authentication headers.
+* Configurable request timeouts.
+* Translation of HTTP failures into integration-specific exceptions.
+* Translation of HTTPX timeout errors into transient integration failures.
+* Translation of network and connection errors into transient integration failures.
+* HTTP `401` handling as an authentication failure.
+* HTTP `429` handling as a rate-limit failure.
+* `Retry-After` handling for rate-limited responses.
+* Classification of HTTP `500`, `502`, `503`, and `504` responses as transient integration failures.
+
+This keeps HTTP-specific concerns isolated from higher-level application logic.
 
 ### Vendor client
 
@@ -132,6 +158,53 @@ This follows the Dependency Inversion Principle and makes the integration client
 
 Secrets such as access tokens are expected to come from environment variables and must not be hardcoded or logged.
 
+### Authentication
+
+Outbound vendor requests support Bearer token authentication.
+
+Conceptually:
+
+```http
+Authorization: Bearer <access-token>
+```
+
+The access token is provided through configuration and is expected to come from environment variables rather than source code.
+
+Authentication failures returned as HTTP `401` responses are translated into `AuthenticationError`.
+
+### HTTP error translation
+
+The HTTP transport translates low-level HTTP and network failures into the project's integration exception hierarchy.
+
+Current mappings include:
+
+```text
+401
+  -> AuthenticationError
+
+429
+  -> RateLimitError
+
+500 / 502 / 503 / 504
+  -> TransientIntegrationError
+
+HTTPX timeout
+  -> TransientIntegrationError
+
+HTTPX network / connection failure
+  -> TransientIntegrationError
+```
+
+This prevents HTTPX-specific failures from leaking into higher-level application code and provides consistent error semantics across integrations.
+
+### Rate-limit handling
+
+HTTP `429 Too Many Requests` responses are recognized as rate-limit failures.
+
+When the remote service provides a `Retry-After` header, the transport preserves the relevant rate-limit information through the integration error boundary so retry behavior can make informed decisions.
+
+More advanced retry scheduling, exponential backoff, and jitter remain part of a later resilience phase.
+
 ### Retry decorator
 
 The project includes a configurable `retry` decorator.
@@ -143,8 +216,7 @@ Example:
     max_attempts=3,
     retry_on=(TimeoutError, ConnectionError),
 )
-def call_vendor():
-    ...
+def call_vendor(): ...
 ```
 
 Current behavior:
@@ -155,7 +227,7 @@ Current behavior:
 * Re-raises the final retryable exception after attempts are exhausted.
 * Preserves function metadata using `functools.wraps`.
 
-Backoff, jitter, logging, and `Retry-After` support are intentionally deferred to a later resilience phase.
+Backoff, jitter, and more advanced retry scheduling are intentionally deferred to a later resilience phase.
 
 ### Generators and lazy iteration
 
@@ -217,17 +289,23 @@ The current test suite covers:
 * Cleanup when exceptions occur.
 * Exception propagation from context managers.
 * Generator-based context managers with `contextlib.contextmanager`.
+* HTTP transport request behavior.
+* Bearer authentication headers.
+* HTTPX `MockTransport` based integration tests.
+* Authentication error translation for HTTP `401`.
+* Rate-limit error translation for HTTP `429`.
+* `Retry-After` handling.
+* Transient error classification for HTTP `500`.
+* Transient error classification for HTTP `502`.
+* Transient error classification for HTTP `503`.
+* Transient error classification for HTTP `504`.
+* Timeout error translation.
+* Network and connection error translation.
 
 Current test count:
 
 ```text
-23 tests
-```
-
-The current suite passes successfully:
-
-```text
-23 passed
+35 tests
 ```
 
 Run the suite with:
@@ -327,14 +405,18 @@ The project follows several principles that will guide future changes:
 * Prefer composition over unnecessary inheritance.
 * Depend on abstractions at integration boundaries.
 * Keep responsibilities small and explicit.
+* Keep HTTP-specific behavior behind transport abstractions.
+* Translate external-library failures into domain-specific integration errors.
 * Retry only failures that are actually retryable.
 * Never silently swallow exceptions.
 * Preserve original exceptions and tracebacks when possible.
 * Avoid hardcoding credentials.
+* Never log access tokens or other secrets.
 * Validate configuration early.
 * Prefer lazy processing when large datasets do not need to be fully loaded into memory.
 * Use context managers for deterministic cleanup of managed resources.
 * Write tests around observable behavior rather than implementation details.
+* Use HTTPX `MockTransport` to test HTTP behavior without real network calls.
 * Keep integrations replaceable and easy to isolate in tests.
 
 ## Roadmap
@@ -355,19 +437,22 @@ The project will evolve incrementally.
 * [x] Pagination and iterator tests.
 * [x] Context manager protocol with `__enter__` and `__exit__`.
 * [x] Generator-based context managers with `contextlib.contextmanager`.
+* [x] HTTP transport with HTTPX.
+* [x] Bearer authentication headers.
+* [x] HTTP exception translation.
+* [x] HTTP timeout and network error translation.
+* [x] Rate-limit handling with `Retry-After`.
+* [x] Transient error classification for `500`, `502`, `503`, and `504`.
+* [x] `MockTransport`-based HTTP tests.
 
 ### Next
 
 * [ ] Apply lazy iteration to a real paginated client flow.
-* [ ] Concrete HTTPX transport.
-* [ ] REST integration behavior.
-* [ ] Authentication flows.
 * [ ] Data transformation and validation.
 * [ ] Advanced pytest fixtures and mocks.
 * [ ] Coverage reporting.
 * [ ] Retry backoff and jitter.
-* [ ] HTTP `429` and `Retry-After`.
-* [ ] Rate limiting.
+* [ ] Client-side rate limiting.
 * [ ] GraphQL integration.
 * [ ] gRPC integration.
 * [ ] Docker.
@@ -381,3 +466,5 @@ The project will evolve incrementally.
 This repository is under active development and is intentionally built in small, reviewable increments.
 
 Each phase adds a focused backend concept together with tests before moving to the next topic.
+
+The current implementation includes a concrete HTTPX transport layer with authentication, HTTP error translation, timeout and network failure handling, rate-limit awareness, and isolated HTTP tests without real network access.
