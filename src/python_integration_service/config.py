@@ -19,3 +19,7 @@ class Settings(BaseSettings):
             raise ValueError("vendor_access_token cannot be empty")
 
         return value
+
+
+def load_settings() -> Settings:
+    return Settings()  # pyright: ignore[reportCallIssue]
