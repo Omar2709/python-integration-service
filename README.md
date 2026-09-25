@@ -8,39 +8,42 @@ The project focuses on designing integrations that are explicit, testable, maint
 
 The main goals of this project are to practice and demonstrate:
 
-* Clean Python design and object-oriented programming.
-* Dependency inversion and transport abstractions.
-* Custom exception hierarchies for external integrations.
-* Configurable retry mechanisms.
-* Iterators, generators, and lazy pagination.
-* Context managers and deterministic resource cleanup.
-* REST API integrations.
-* HTTP transport with HTTPX.
-* Authentication and secure configuration using environment variables.
-* HTTP error translation and transient failure classification.
-* Rate-limit handling.
-* Data validation and transformation.
-* Testing with `pytest`.
-* Mocks, fixtures, and coverage.
-* Resilience patterns such as backoff, jitter, timeouts, and rate-limit handling.
-* Continuous integration with GitHub Actions.
-* Docker and continuous deployment.
-* Cloud-oriented integration architecture.
-* Basic Kubernetes deployment concepts.
-* Security concepts relevant to backend integrations.
+- Clean Python design and object-oriented programming.
+- Dependency inversion and transport abstractions.
+- Custom exception hierarchies for external integrations.
+- Explicit configuration ownership.
+- Composition roots and dependency wiring.
+- Configurable retry mechanisms.
+- Iterators, generators, and lazy pagination.
+- Context managers and deterministic resource cleanup.
+- REST API integrations.
+- HTTP transport with HTTPX.
+- Authentication and secure configuration using environment variables.
+- HTTP error translation and transient failure classification.
+- Rate-limit handling.
+- Data validation and transformation.
+- Testing with `pytest`.
+- Mocks, fixtures, parametrization, and coverage.
+- Resilience patterns such as backoff, jitter, timeouts, and rate-limit handling.
+- Continuous integration with GitHub Actions.
+- Docker and continuous deployment.
+- Cloud-oriented integration architecture.
+- Basic Kubernetes deployment concepts.
+- Security concepts relevant to backend integrations.
 
 ## Tech Stack
 
-* Python 3.13+
-* FastAPI
-* HTTPX
-* Pydantic Settings
-* Uvicorn
-* pytest
-* pytest-cov
-* Ruff
-* uv
-* GitHub Actions
+- Python 3.13+
+- FastAPI
+- HTTPX
+- Pydantic
+- Pydantic Settings
+- Uvicorn
+- pytest
+- pytest-cov
+- Ruff
+- uv
+- GitHub Actions
 
 ## Project Structure
 
@@ -52,6 +55,8 @@ python-integration-service/
 ├── src/
 │   └── python_integration_service/
 │       ├── __init__.py
+│       ├── composition.py
+│       ├── config.py
 │       ├── main.py
 │       └── integrations/
 │           ├── __init__.py
@@ -65,13 +70,15 @@ python-integration-service/
 │           ├── transport.py
 │           └── vendor_client.py
 ├── tests/
-│   └── integrations/
-│       ├── test_httpx_transport.py
-│       ├── test_managed_resource.py
-│       ├── test_page_iterator.py
-│       ├── test_pagination.py
-│       ├── test_resource_context.py
-│       └── test_retry.py
+│   ├── integrations/
+│   │   ├── test_httpx_transport.py
+│   │   ├── test_managed_resource.py
+│   │   ├── test_page_iterator.py
+│   │   ├── test_pagination.py
+│   │   ├── test_resource_context.py
+│   │   └── test_retry.py
+│   ├── test_composition.py
+│   └── test_config.py
 ├── .env.example
 ├── .gitignore
 ├── .python-version
@@ -102,11 +109,11 @@ Custom exceptions provide a clear domain boundary for integration failures.
 
 Current exception types include:
 
-* `IntegrationError`
-* `ConfigurationError`
-* `AuthenticationError`
-* `RateLimitError`
-* `TransientIntegrationError`
+- `IntegrationError`
+- `ConfigurationError`
+- `AuthenticationError`
+- `RateLimitError`
+- `TransientIntegrationError`
 
 This allows higher-level application code to distinguish integration-specific failures from unrelated programming errors.
 
@@ -130,6 +137,107 @@ Transport
 
 This follows the Dependency Inversion Principle and makes the integration client easier to test while allowing the concrete HTTP implementation to be replaced independently.
 
+### Configuration
+
+Application configuration is loaded and validated through Pydantic Settings.
+
+Current configuration includes:
+
+- Vendor base URL validation using `AnyHttpUrl`.
+- Access-token protection using `SecretStr`.
+- Rejection of empty or whitespace-only access tokens.
+- Positive timeout validation.
+- A default timeout of `30.0` seconds.
+- Environment-variable loading.
+- Optional `.env` file loading.
+
+Current environment variables are:
+
+```text
+VENDOR_BASE_URL
+VENDOR_ACCESS_TOKEN
+VENDOR_TIMEOUT
+```
+
+Configuration parsing and validation are intentionally kept separate from dependency construction.
+
+`Settings` owns configuration-specific representations such as `AnyHttpUrl` and `SecretStr`, while integration components receive the simpler values they actually require.
+
+Conceptually:
+
+```text
+Environment / .env
+       |
+       v
+    Settings
+       |
+       v
+Composition Root
+```
+
+`SecretStr` protects the access token from accidental exposure in common string representations and logs. It is not cryptographic protection for process memory.
+
+The real token value is extracted explicitly only where it is required to construct the HTTP transport.
+
+### Composition root
+
+The composition root is responsible for constructing and wiring concrete integration dependencies.
+
+Conceptually:
+
+```text
+Settings
+   |
+   v
+HttpxTransport
+   |
+   v
+VendorClient
+```
+
+Its current responsibilities include:
+
+- Extracting the real access-token value from `SecretStr`.
+- Converting `AnyHttpUrl` into the `str` expected by `VendorClient`.
+- Constructing `HttpxTransport`.
+- Constructing `VendorClient`.
+- Injecting the concrete transport through the `Transport` abstraction.
+- Owning the HTTP transport lifecycle through a context manager.
+
+The composition root currently exposes `create_vendor_client()` as a context manager.
+
+Conceptually:
+
+```python
+with create_vendor_client(settings) as client:
+    result = client.get("/items")
+```
+
+The lifecycle is:
+
+```text
+create HttpxTransport
+        |
+        v
+create VendorClient
+        |
+        v
+yield client
+        |
+        v
+application usage
+        |
+        v
+exit transport context
+        |
+        v
+close httpx.Client
+```
+
+Cleanup occurs both after normal execution and when an exception propagates from inside the context.
+
+This prevents Pydantic, environment loading, concrete HTTP construction, and resource-lifecycle concerns from leaking into `VendorClient`.
+
 ### HTTPX transport
 
 The project includes a concrete HTTP transport implemented with `httpx.Client`.
@@ -138,32 +246,43 @@ The project includes a concrete HTTP transport implemented with `httpx.Client`.
 
 Current behavior includes:
 
-* Outbound requests through `httpx.Client`.
-* Bearer authentication headers.
-* Configurable request timeouts.
-* Translation of HTTP failures into integration-specific exceptions.
-* Translation of HTTPX timeout errors into transient integration failures.
-* Translation of network and connection errors into transient integration failures.
-* HTTP `401` handling as an authentication failure.
-* HTTP `429` handling as a rate-limit failure.
-* `Retry-After` handling for rate-limited responses.
-* Classification of HTTP `500`, `502`, `503`, and `504` responses as transient integration failures.
+- Outbound requests through `httpx.Client`.
+- Bearer authentication headers.
+- Configurable request timeouts.
+- Context-manager support.
+- Deterministic cleanup of the underlying `httpx.Client`.
+- Translation of HTTP failures into integration-specific exceptions.
+- Translation of HTTPX timeout errors into transient integration failures.
+- Translation of network and connection errors into transient integration failures.
+- HTTP `401` handling as an authentication failure.
+- HTTP `429` handling as a rate-limit failure.
+- `Retry-After` handling for rate-limited responses.
+- Classification of HTTP `500`, `502`, `503`, and `504` responses as transient integration failures.
 
 This keeps HTTP-specific concerns isolated from higher-level application logic.
 
 ### Vendor client
 
-`VendorClient` currently provides:
+`VendorClient` is responsible for provider-specific request composition while depending only on the `Transport` abstraction.
 
-* Base URL configuration.
-* Access-token configuration.
-* Timeout validation.
-* Environment-based construction with `from_env`.
-* URL construction.
-* URL validation.
-* Delegation of outbound requests to a `Transport`.
+Current responsibilities include:
 
-Secrets such as access tokens are expected to come from environment variables and must not be hardcoded or logged.
+- Base URL ownership.
+- URL construction.
+- Delegation of outbound requests to a `Transport`.
+
+HTTP authentication, timeout configuration, environment-variable loading, configuration parsing, and transport lifecycle management are intentionally kept outside `VendorClient`.
+
+Conceptually:
+
+```text
+VendorClient
+├── base_url
+├── build_url()
+└── Transport
+```
+
+This keeps the client focused on provider-specific behavior rather than infrastructure configuration.
 
 ### Authentication
 
@@ -175,7 +294,9 @@ Conceptually:
 Authorization: Bearer <access-token>
 ```
 
-The access token is provided through configuration and is expected to come from environment variables rather than source code.
+The access token is loaded through `Settings`, represented as `SecretStr`, explicitly extracted in the composition root, and passed to `HttpxTransport`.
+
+Real credentials must not be hardcoded or logged.
 
 Authentication failures returned as HTTP `401` responses are translated into `AuthenticationError`.
 
@@ -201,6 +322,8 @@ HTTPX timeout
 HTTPX network / connection failure
   -> TransientIntegrationError
 ```
+
+Other non-success HTTP statuses are translated into `IntegrationError`.
 
 This prevents HTTPX-specific failures from leaking into higher-level application code and provides consistent error semantics across integrations.
 
@@ -228,11 +351,11 @@ def call_vendor(): ...
 
 Current behavior:
 
-* Validates that `max_attempts` is greater than zero.
-* Retries only explicitly configured exception types.
-* Immediately propagates non-retryable exceptions.
-* Re-raises the final retryable exception after attempts are exhausted.
-* Preserves function metadata using `functools.wraps`.
+- Validates that `max_attempts` is greater than zero.
+- Retries only explicitly configured exception types.
+- Immediately propagates non-retryable exceptions.
+- Re-raises the final retryable exception after attempts are exhausted.
+- Preserves function metadata using `functools.wraps`.
 
 Backoff, jitter, and more advanced retry scheduling are intentionally deferred to a later resilience phase.
 
@@ -255,10 +378,10 @@ __next__()
 
 It demonstrates the mechanics that Python generators normally manage automatically:
 
-* Current page state.
-* Current item position.
-* Empty-page handling.
-* `StopIteration`.
+- Current page state.
+- Current item position.
+- Empty-page handling.
+- `StopIteration`.
 
 ### Context managers
 
@@ -266,53 +389,69 @@ The project includes examples of both class-based and generator-based context ma
 
 `ManagedResource` demonstrates the context manager protocol through:
 
-* `__enter__`
-* `__exit__`
-* Resource setup and cleanup.
-* Cleanup even when exceptions occur.
-* Explicit exception propagation.
+- `__enter__`
+- `__exit__`
+- Resource setup and cleanup.
+- Cleanup after normal execution.
+- Cleanup when exceptions occur.
+- Explicit exception propagation.
 
 `managed_resource` demonstrates the same lifecycle using `contextlib.contextmanager` and `try/finally`.
 
-This illustrates how context managers provide deterministic resource cleanup for files, HTTP clients, database connections, locks, and similar resources.
+The composition root also uses `contextlib.contextmanager` to model ownership of `HttpxTransport` and guarantee deterministic cleanup.
+
+These examples illustrate how context managers provide deterministic resource cleanup for files, HTTP clients, database connections, locks, and similar resources.
 
 ## Tests
 
 The current test suite covers:
 
-* Retry success on the first attempt.
-* Retry after transient failures.
-* Immediate propagation of non-retryable exceptions.
-* Exhausted retry attempts.
-* Invalid retry configuration.
-* Preservation of decorated function metadata.
-* Generator behavior across multiple pages.
-* Empty pagination scenarios.
-* Manual iterator behavior.
-* Iterator exhaustion with `StopIteration`.
-* Iterator identity.
-* Class-based context manager lifecycle.
-* Cleanup after normal context exit.
-* Cleanup when exceptions occur.
-* Exception propagation from context managers.
-* Generator-based context managers with `contextlib.contextmanager`.
-* HTTP transport request behavior.
-* Bearer authentication headers.
-* HTTPX `MockTransport` based integration tests.
-* Authentication error translation for HTTP `401`.
-* Rate-limit error translation for HTTP `429`.
-* `Retry-After` handling.
-* Transient error classification for HTTP `500`.
-* Transient error classification for HTTP `502`.
-* Transient error classification for HTTP `503`.
-* Transient error classification for HTTP `504`.
-* Timeout error translation.
-* Network and connection error translation.
+- Retry success on the first attempt.
+- Retry after transient failures.
+- Immediate propagation of non-retryable exceptions.
+- Exhausted retry attempts.
+- Invalid retry configuration.
+- Preservation of decorated function metadata.
+- Generator behavior across multiple pages.
+- Empty pagination scenarios.
+- Manual iterator behavior.
+- Iterator exhaustion with `StopIteration`.
+- Iterator identity.
+- Class-based context manager lifecycle.
+- Cleanup after normal context exit.
+- Cleanup when exceptions occur.
+- Exception propagation from context managers.
+- Generator-based context managers with `contextlib.contextmanager`.
+- HTTP transport request behavior.
+- Bearer authentication headers.
+- HTTPX `MockTransport`-based integration tests.
+- Authentication error translation for HTTP `401`.
+- Rate-limit error translation for HTTP `429`.
+- `Retry-After` handling.
+- Transient error classification for HTTP `500`.
+- Transient error classification for HTTP `502`.
+- Transient error classification for HTTP `503`.
+- Transient error classification for HTTP `504`.
+- Permanent HTTP error translation.
+- Timeout error translation.
+- Network and connection error translation.
+- Settings loading from environment variables.
+- Settings URL validation.
+- Default timeout configuration.
+- Positive timeout validation.
+- Rejection of empty access tokens.
+- Rejection of whitespace-only access tokens.
+- Secret-value preservation through `SecretStr`.
+- Composition-root dependency wiring.
+- Explicit `SecretStr` to `str` adaptation.
+- `AnyHttpUrl` to `str` adaptation.
+- Transport lifecycle cleanup.
+- Transport cleanup when exceptions propagate.
 
 Current test count:
 
 ```text
-35 tests
+46 tests
 ```
 
 Run the suite with:
@@ -357,21 +496,21 @@ uv run pytest --cov=python_integration_service --cov-report=term-missing
 
 GitHub Actions runs the project's quality checks automatically on:
 
-* Pushes to `main`.
-* Pull requests targeting `main`.
-* Manual workflow executions.
+- Pushes to `main`.
+- Pull requests targeting `main`.
+- Manual workflow executions.
 
 The CI pipeline:
 
-* Sets up the project Python version.
-* Installs `uv`.
-* Installs dependencies from the committed lockfile.
-* Verifies formatting with Ruff.
-* Runs Ruff lint checks.
-* Executes the pytest suite.
-* Generates code coverage reports.
-* Generates JUnit XML test reports.
-* Uploads test reports as GitHub Actions artifacts.
+- Sets up the project Python version.
+- Installs `uv`.
+- Installs dependencies from the committed lockfile.
+- Verifies formatting with Ruff.
+- Runs Ruff lint checks.
+- Executes the pytest suite.
+- Generates code coverage reports.
+- Generates JUnit XML test reports.
+- Uploads test reports as GitHub Actions artifacts.
 
 Conceptually:
 
@@ -402,8 +541,8 @@ Continuous integration verifies changes automatically. Continuous deployment is 
 
 ### Requirements
 
-* Python 3.13 or newer
-* `uv`
+- Python 3.13 or newer
+- `uv`
 
 Clone the repository:
 
@@ -432,7 +571,27 @@ VENDOR_ACCESS_TOKEN=replace-with-local-development-value
 VENDOR_TIMEOUT=30
 ```
 
+Configuration rules:
+
+```text
+VENDOR_BASE_URL
+→ required
+→ valid HTTP/HTTPS URL
+
+VENDOR_ACCESS_TOKEN
+→ required
+→ cannot be empty
+→ cannot contain only whitespace
+
+VENDOR_TIMEOUT
+→ optional
+→ defaults to 30.0
+→ must be greater than 0
+```
+
 Real secrets must be provided through environment variables or a proper secret-management system.
+
+`SecretStr` reduces accidental disclosure through string representations but does not encrypt secret values in application memory.
 
 ## Running the API
 
@@ -450,27 +609,36 @@ http://127.0.0.1:8000/health
 
 The expected result is a successful health response from the application.
 
+The FastAPI application does not yet integrate the vendor client's lifecycle into the application lifespan. That integration is intentionally reserved for a later phase.
+
 ## Development Principles
 
 The project follows several principles that will guide future changes:
 
-* Prefer composition over unnecessary inheritance.
-* Depend on abstractions at integration boundaries.
-* Keep responsibilities small and explicit.
-* Keep HTTP-specific behavior behind transport abstractions.
-* Translate external-library failures into domain-specific integration errors.
-* Retry only failures that are actually retryable.
-* Never silently swallow exceptions.
-* Preserve original exceptions and tracebacks when possible.
-* Avoid hardcoding credentials.
-* Never log access tokens or other secrets.
-* Validate configuration early.
-* Prefer lazy processing when large datasets do not need to be fully loaded into memory.
-* Use context managers for deterministic cleanup of managed resources.
-* Write tests around observable behavior rather than implementation details.
-* Use HTTPX `MockTransport` to test HTTP behavior without real network calls.
-* Automate repeatable quality checks through continuous integration.
-* Keep integrations replaceable and easy to isolate in tests.
+- Prefer composition over unnecessary inheritance.
+- Depend on abstractions at integration boundaries.
+- Keep responsibilities small and explicit.
+- Keep configuration parsing separate from dependency construction.
+- Centralize concrete dependency wiring in a composition root.
+- Keep HTTP-specific behavior behind transport abstractions.
+- Keep Pydantic-specific types at the configuration boundary.
+- Translate external-library failures into domain-specific integration errors.
+- Retry only failures that are actually retryable.
+- Never silently swallow exceptions.
+- Preserve original exceptions and tracebacks when possible.
+- Avoid hardcoding credentials.
+- Never log access tokens or other secrets.
+- Validate configuration early.
+- Make secret extraction explicit and localized.
+- Prefer lazy processing when large datasets do not need to be fully loaded into memory.
+- Use context managers for deterministic cleanup of managed resources.
+- Make resource ownership and lifecycle explicit.
+- Write tests around observable behavior rather than implementation details.
+- Patch dependencies where they are looked up by the code under test.
+- Use HTTPX `MockTransport` to test HTTP behavior without real network calls.
+- Use pytest fixtures and `monkeypatch` to isolate test state.
+- Automate repeatable quality checks through continuous integration.
+- Keep integrations replaceable and easy to isolate in tests.
 
 ## Roadmap
 
@@ -478,45 +646,56 @@ The project will evolve incrementally.
 
 ### Completed
 
-* [x] Initial FastAPI application.
-* [x] Integration exception hierarchy.
-* [x] Transport abstraction.
-* [x] Vendor client foundation.
-* [x] Environment-based client configuration.
-* [x] Configurable retry decorator.
-* [x] Retry behavior tests.
-* [x] Generator fundamentals.
-* [x] Manual iterator implementation.
-* [x] Pagination and iterator tests.
-* [x] Context manager protocol with `__enter__` and `__exit__`.
-* [x] Generator-based context managers with `contextlib.contextmanager`.
-* [x] HTTP transport with HTTPX.
-* [x] Bearer authentication headers.
-* [x] HTTP exception translation.
-* [x] HTTP timeout and network error translation.
-* [x] Rate-limit handling with `Retry-After`.
-* [x] Transient error classification for `500`, `502`, `503`, and `504`.
-* [x] `MockTransport`-based HTTP tests.
-* [x] GitHub Actions continuous integration.
-* [x] Automated Ruff format verification.
-* [x] Automated Ruff lint checks.
-* [x] Automated pytest execution.
-* [x] Coverage and JUnit report generation in CI.
+- [x] Initial FastAPI application.
+- [x] Integration exception hierarchy.
+- [x] Transport abstraction.
+- [x] Vendor client foundation.
+- [x] Separation of configuration concerns from `VendorClient`.
+- [x] Pydantic Settings-based configuration.
+- [x] URL validation with `AnyHttpUrl`.
+- [x] Secret handling with `SecretStr`.
+- [x] Timeout configuration and validation.
+- [x] Composition root for integration dependency wiring.
+- [x] Explicit configuration-type adaptation at the composition boundary.
+- [x] Composition-root transport lifecycle management.
+- [x] Configurable retry decorator.
+- [x] Retry behavior tests.
+- [x] Generator fundamentals.
+- [x] Manual iterator implementation.
+- [x] Pagination and iterator tests.
+- [x] Context manager protocol with `__enter__` and `__exit__`.
+- [x] Generator-based context managers with `contextlib.contextmanager`.
+- [x] HTTP transport with HTTPX.
+- [x] Bearer authentication headers.
+- [x] HTTP exception translation.
+- [x] HTTP timeout and network error translation.
+- [x] Rate-limit handling with `Retry-After`.
+- [x] Transient error classification for `500`, `502`, `503`, and `504`.
+- [x] `MockTransport`-based HTTP tests.
+- [x] Settings validation tests.
+- [x] Composition-root wiring tests.
+- [x] Composition-root lifecycle tests.
+- [x] GitHub Actions continuous integration.
+- [x] Automated Ruff format verification.
+- [x] Automated Ruff lint checks.
+- [x] Automated pytest execution.
+- [x] Coverage and JUnit report generation in CI.
 
 ### Next
 
-* [ ] Apply lazy iteration to a real paginated client flow.
-* [ ] Data transformation and validation.
-* [ ] Advanced pytest fixtures and mocks.
-* [ ] Retry backoff and jitter.
-* [ ] Client-side rate limiting.
-* [ ] GraphQL integration.
-* [ ] gRPC integration.
-* [ ] Docker.
-* [ ] Continuous deployment.
-* [ ] AWS-oriented integration architecture.
-* [ ] Kubernetes fundamentals.
-* [ ] Security and dependency-vulnerability practices.
+- [ ] Integrate dependency lifecycle with FastAPI lifespan.
+- [ ] Apply lazy iteration to a real paginated client flow.
+- [ ] Data transformation and validation.
+- [ ] Advanced pytest fixtures and mocks.
+- [ ] Retry backoff and jitter.
+- [ ] Client-side rate limiting.
+- [ ] GraphQL integration.
+- [ ] gRPC integration.
+- [ ] Docker.
+- [ ] Continuous deployment.
+- [ ] AWS-oriented integration architecture.
+- [ ] Kubernetes fundamentals.
+- [ ] Security and dependency-vulnerability practices.
 
 ## Status
 
@@ -524,4 +703,6 @@ This repository is under active development and is intentionally built in small,
 
 Each phase adds a focused backend concept together with tests before moving to the next topic.
 
-The current implementation includes a concrete HTTPX transport layer with authentication, HTTP error translation, timeout and network failure handling, rate-limit awareness, isolated HTTP tests without real network access, and a GitHub Actions CI pipeline that automatically verifies formatting, linting, tests, coverage, and test reports.
+The current implementation includes validated application configuration with Pydantic Settings, explicit secret handling with `SecretStr`, a composition root that wires and owns integration resources, a focused `VendorClient`, a concrete HTTPX transport with authentication and deterministic cleanup, HTTP error translation, timeout and network failure handling, rate-limit awareness, isolated tests without real network access, and a GitHub Actions CI pipeline that verifies formatting, linting, tests, coverage, and test reports.
+
+The current suite contains 46 passing tests.
