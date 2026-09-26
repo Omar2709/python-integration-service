@@ -60,6 +60,9 @@ python-integration-service/
 ├── .github/
 │   └── workflows/
 │       └── ci.yml
+├── .vscode/
+│   ├── settings.json
+│   └── tasks.json
 ├── src/
 │   └── python_integration_service/
 │       ├── __init__.py
@@ -105,7 +108,7 @@ python-integration-service/
 
 Generated local directories and files such as `.venv/`, `.pytest_cache/`, `.ruff_cache/`, `__pycache__/`, `.coverage`, `coverage.xml`, and `junit.xml` are intentionally omitted from the project structure.
 
-Local editor configuration such as `.vscode/` is also intentionally kept outside the repository.
+Project-specific VS Code configuration is versioned for reproducible development workflows. Only shared settings and tasks are committed; personal editor preferences remain excluded from the repository.
 
 ## Current Implementation
 
@@ -329,7 +332,7 @@ Outbound vendor requests support Bearer token authentication.
 Conceptually:
 
 ```http
-Authorization: Bearer <access-token>
+Authorization: Bearer \<access-token>
 ```
 
 The access token is loaded through `Settings`, represented as `SecretStr`, explicitly extracted in the composition root, and passed to `HttpxTransport`.
@@ -532,6 +535,39 @@ Run tests with coverage:
 uv run pytest --cov=python_integration_service --cov-report=term-missing
 ```
 
+### VS Code automation
+
+The repository includes project-level VS Code configuration for repeatable local quality checks.
+
+When editing Python files:
+
+```text
+Ctrl + S
+→ Ruff fix actions
+→ import organization
+→ Ruff formatting
+```
+
+The default VS Code build task provides a repository-wide Ruff pass:
+
+```text
+Ctrl + Shift + B
+→ uv run ruff check --fix .
+→ uv run ruff format .
+```
+
+Ruff applies safe automatic fixes by default. Potentially unsafe fixes are not enabled globally.
+
+The VS Code shortcuts improve the local development workflow but do not replace the final quality gate before committing changes.
+
+Before committing a completed development block, run:
+
+```bash
+uv run ruff check .
+uv run pytest -v
+git diff --check
+```
+
 ## Continuous Integration
 
 GitHub Actions runs the project's quality checks automatically on:
@@ -678,6 +714,9 @@ The project follows several principles that will guide future changes:
 - Use pytest fixtures and `monkeypatch` to isolate test state.
 - Automate repeatable quality checks through continuous integration.
 - Keep integrations replaceable and easy to isolate in tests.
+- Automate safe formatting and lint fixes during local development.
+- Keep shared editor automation reproducible while excluding personal editor preferences.
+- Run the full quality gate before committing each completed development block.
 
 ## Roadmap
 
@@ -725,6 +764,8 @@ The project will evolve incrementally.
 - [x] Automated Ruff lint checks.
 - [x] Automated pytest execution.
 - [x] Coverage and JUnit report generation in CI.
+- [x] VS Code Ruff format and fix automation.
+- [x] Repository-wide Ruff build task.
 
 ### Next
 

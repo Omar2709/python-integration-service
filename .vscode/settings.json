@@ -1,0 +1,46 @@
+{
+    "cSpell.language": "en,es",
+
+    "cSpell.words": [
+        "contextlib",
+        "contextmanager",
+        "delenv",
+        "fastapi",
+        "FastAPI",
+        "functools",
+        "htmlcov",
+        "httpx",
+        "Httpx",
+        "HTTPX",
+        "junitxml",
+        "monkeypatch",
+        "mypy",
+        "pycache",
+        "pydantic",
+        "Pydantic",
+        "pyproject",
+        "pytest",
+        "setenv",
+        "Starlette",
+        "uvicorn",
+        "Uvicorn",
+        "venv"
+    ],
+
+    "python.terminal.activateEnvironment": false,
+
+    "explorer.compactFolders": false,
+
+    "[python]": {
+        "editor.defaultFormatter": "charliermarsh.ruff",
+        "editor.formatOnSave": true,
+
+        "editor.codeActionsOnSave": {
+            "source.fixAll.ruff": "explicit",
+            "source.organizeImports.ruff": "explicit"
+        }
+    },
+
+    "ruff.nativeServer": "on",
+    "python-envs.defaultEnvManager": "ms-python.python:system"
+}

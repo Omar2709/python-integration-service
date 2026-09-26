@@ -15,5 +15,8 @@ coverage.xml
 junit.xml
 htmlcov/
 
-.vscode/
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+
 .idea/
