@@ -139,7 +139,7 @@ def test_get_vendor_items_rejects_invalid_page_query(
         (
             RateLimitError(
                 "provider rate limit exceeded",
-                retry_after="30",
+                retry_after_seconds=30.0,
             ),
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "upstream_rate_limited",
@@ -203,13 +203,13 @@ def test_integration_errors_are_translated_to_public_http_responses(
     vendor_client.get_items_page.assert_called_once_with(page=1)
 
 
-def test_rate_limit_error_preserves_valid_retry_after_seconds(
+def test_rate_limit_error_exposes_retry_after_seconds(
     test_app: FastAPI,
     vendor_client: MagicMock,
 ) -> None:
     vendor_client.get_items_page.side_effect = RateLimitError(
         "provider rate limit exceeded",
-        retry_after="30",
+        retry_after_seconds=30.0,
     )
 
     with TestClient(test_app) as client:
@@ -219,43 +219,45 @@ def test_rate_limit_error_preserves_valid_retry_after_seconds(
     assert response.headers["Retry-After"] == "30"
 
 
-def test_rate_limit_error_preserves_valid_retry_after_http_date(
+def test_rate_limit_error_rounds_retry_after_up(
     test_app: FastAPI,
     vendor_client: MagicMock,
 ) -> None:
-    retry_after = "Fri, 31 Dec 1999 23:59:59 GMT"
-
     vendor_client.get_items_page.side_effect = RateLimitError(
         "provider rate limit exceeded",
-        retry_after=retry_after,
+        retry_after_seconds=30.2,
     )
 
     with TestClient(test_app) as client:
         response = client.get("/vendor/items")
 
     assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
-    assert response.headers["Retry-After"] == retry_after
+    assert response.headers["Retry-After"] == "31"
 
 
-@pytest.mark.parametrize(
-    "retry_after",
-    [
-        None,
-        "",
-        "   ",
-        "-10",
-        "bananas",
-        "Fri, 31 Dec 1999 23:59:59",
-    ],
-)
-def test_rate_limit_error_omits_invalid_retry_after(
+def test_rate_limit_error_exposes_zero_retry_after(
     test_app: FastAPI,
     vendor_client: MagicMock,
-    retry_after: str | None,
 ) -> None:
     vendor_client.get_items_page.side_effect = RateLimitError(
         "provider rate limit exceeded",
-        retry_after=retry_after,
+        retry_after_seconds=0.0,
+    )
+
+    with TestClient(test_app) as client:
+        response = client.get("/vendor/items")
+
+    assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+    assert response.headers["Retry-After"] == "0"
+
+
+def test_rate_limit_error_omits_missing_retry_after(
+    test_app: FastAPI,
+    vendor_client: MagicMock,
+) -> None:
+    vendor_client.get_items_page.side_effect = RateLimitError(
+        "provider rate limit exceeded",
+        retry_after_seconds=None,
     )
 
     with TestClient(test_app) as client:

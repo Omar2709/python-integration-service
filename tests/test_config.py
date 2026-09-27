@@ -13,6 +13,12 @@ def valid_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("VENDOR_BASE_URL", "https://api.example.com")
     monkeypatch.setenv("VENDOR_ACCESS_TOKEN", "test-token")
     monkeypatch.setenv("VENDOR_TIMEOUT", "15")
+    monkeypatch.setenv("VENDOR_RETRY_MAX_ATTEMPTS", "4")
+    monkeypatch.setenv("VENDOR_RETRY_BASE_DELAY", "0.75")
+    monkeypatch.setenv(
+        "VENDOR_RETRY_MAX_RETRY_AFTER_SECONDS",
+        "120",
+    )
 
 
 def test_loads_valid_settings(valid_env: None) -> None:
@@ -21,6 +27,9 @@ def test_loads_valid_settings(valid_env: None) -> None:
     assert str(settings.vendor_base_url) == "https://api.example.com/"
     assert settings.vendor_access_token.get_secret_value() == "test-token"
     assert settings.vendor_timeout == 15.0
+    assert settings.vendor_retry_max_attempts == 4
+    assert settings.vendor_retry_base_delay == 0.75
+    assert settings.vendor_retry_max_retry_after_seconds == 120.0
 
 
 def test_uses_default_timeout_when_env_variable_is_missing(
@@ -32,6 +41,30 @@ def test_uses_default_timeout_when_env_variable_is_missing(
     settings = load_settings_from_env()
 
     assert settings.vendor_timeout == 30.0
+
+
+def test_uses_default_retry_settings(
+    valid_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(
+        "VENDOR_RETRY_MAX_ATTEMPTS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "VENDOR_RETRY_BASE_DELAY",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "VENDOR_RETRY_MAX_RETRY_AFTER_SECONDS",
+        raising=False,
+    )
+
+    settings = load_settings_from_env()
+
+    assert settings.vendor_retry_max_attempts == 3
+    assert settings.vendor_retry_base_delay == 0.5
+    assert settings.vendor_retry_max_retry_after_seconds == 60.0
 
 
 def test_invalid_base_url_raises_validation_error(
@@ -51,6 +84,61 @@ def test_non_positive_timeout_raises_validation_error(
     timeout: str,
 ) -> None:
     monkeypatch.setenv("VENDOR_TIMEOUT", timeout)
+
+    with pytest.raises(ValidationError):
+        load_settings_from_env()
+
+
+@pytest.mark.parametrize(
+    "max_attempts",
+    [
+        "0",
+        "-1",
+    ],
+)
+def test_invalid_retry_max_attempts_raises_validation_error(
+    valid_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    max_attempts: str,
+) -> None:
+    monkeypatch.setenv(
+        "VENDOR_RETRY_MAX_ATTEMPTS",
+        max_attempts,
+    )
+
+    with pytest.raises(ValidationError):
+        load_settings_from_env()
+
+
+def test_negative_retry_base_delay_raises_validation_error(
+    valid_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "VENDOR_RETRY_BASE_DELAY",
+        "-0.5",
+    )
+
+    with pytest.raises(ValidationError):
+        load_settings_from_env()
+
+
+@pytest.mark.parametrize(
+    "max_retry_after_seconds",
+    [
+        "0",
+        "-1",
+    ],
+)
+def test_invalid_retry_max_retry_after_raises_validation_error(
+    valid_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    max_retry_after_seconds: str,
+) -> None:
+    monkeypatch.setenv(
+        "VENDOR_RETRY_MAX_RETRY_AFTER_SECONDS",
+        max_retry_after_seconds,
+    )
 
     with pytest.raises(ValidationError):
         load_settings_from_env()

@@ -1,4 +1,4 @@
-from email.utils import parsedate_to_datetime
+from math import ceil
 
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
@@ -14,29 +14,6 @@ from python_integration_service.integrations.exceptions import (
     UpstreamTimeoutError,
     UpstreamUnavailableError,
 )
-
-
-def _get_valid_retry_after(value: str | None) -> str | None:
-    if value is None:
-        return None
-
-    candidate = value.strip()
-
-    if not candidate:
-        return None
-
-    if candidate.isascii() and candidate.isdigit():
-        return candidate
-
-    try:
-        parsed_date = parsedate_to_datetime(candidate)
-    except (TypeError, ValueError, OverflowError):
-        return None
-
-    if parsed_date.tzinfo is None:
-        return None
-
-    return candidate
 
 
 async def authentication_error_handler(
@@ -69,15 +46,10 @@ async def rate_limit_error_handler(
     request: Request,
     exc: Exception,
 ) -> JSONResponse:
-    retry_after: str | None = None
-
-    if isinstance(exc, RateLimitError):
-        retry_after = _get_valid_retry_after(exc.retry_after)
-
     headers: dict[str, str] = {}
 
-    if retry_after is not None:
-        headers["Retry-After"] = retry_after
+    if isinstance(exc, RateLimitError) and exc.retry_after_seconds is not None:
+        headers["Retry-After"] = str(ceil(exc.retry_after_seconds))
 
     return JSONResponse(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

@@ -1,3 +1,6 @@
+from collections.abc import Callable
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from types import TracebackType
 from typing import Literal, Self
 
@@ -15,13 +18,53 @@ from python_integration_service.integrations.exceptions import (
 from python_integration_service.integrations.transport import Transport
 
 
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _parse_retry_after_seconds(
+    value: str | None,
+    now: Callable[[], datetime],
+) -> float | None:
+    if value is None:
+        return None
+
+    candidate = value.strip()
+
+    if not candidate:
+        return None
+
+    if candidate.isascii() and candidate.isdigit():
+        return float(candidate)
+
+    try:
+        retry_at = parsedate_to_datetime(candidate)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+    if retry_at.tzinfo is None:
+        return None
+
+    current_time = now()
+
+    if current_time.tzinfo is None:
+        raise ValueError("now must return a timezone-aware datetime")
+
+    return max(
+        0.0,
+        (retry_at - current_time).total_seconds(),
+    )
+
+
 class HttpxTransport(Transport):
     def __init__(
         self,
         access_token: str,
         timeout: float,
         transport: httpx.BaseTransport | None = None,
+        now: Callable[[], datetime] = _utc_now,
     ) -> None:
+        self._now = now
         self._client = httpx.Client(
             timeout=timeout,
             transport=transport,
@@ -70,11 +113,14 @@ class HttpxTransport(Transport):
                 ) from exc
 
             if status_code == 429:
-                retry_after = exc.response.headers.get("Retry-After")
+                retry_after_seconds = _parse_retry_after_seconds(
+                    exc.response.headers.get("Retry-After"),
+                    self._now,
+                )
 
                 raise RateLimitError(
                     "External service rate limit exceeded",
-                    retry_after=retry_after,
+                    retry_after_seconds=retry_after_seconds,
                 ) from exc
 
             if status_code in (500, 502):

@@ -6,6 +6,7 @@ from python_integration_service.integrations.exceptions import (
     ConfigurationError,
     InvalidUpstreamResponseError,
 )
+from python_integration_service.integrations.retry import RetryPolicy
 from python_integration_service.integrations.transport import Transport
 from python_integration_service.integrations.vendor_schemas import (
     ItemsPage,
@@ -18,12 +19,14 @@ class VendorClient:
         self,
         base_url: str,
         transport: Transport,
+        retry_policy: RetryPolicy,
     ) -> None:
         if not base_url:
             raise ConfigurationError("base_url is required and cannot be empty")
 
         self.base_url = base_url
         self.transport = transport
+        self.retry_policy = retry_policy
 
     def build_url(self, path: str) -> str:
         base = self.base_url.rstrip("/")
@@ -32,7 +35,8 @@ class VendorClient:
 
     def get(self, path: str) -> dict:
         url = self.build_url(path)
-        return self.transport.get(url)
+
+        return self.retry_policy.execute(lambda: self.transport.get(url))
 
     def get_items_page(self, page: int) -> ItemsPage:
         if page < 1:

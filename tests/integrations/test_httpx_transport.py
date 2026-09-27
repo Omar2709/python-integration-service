@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 import httpx
 import pytest
 
@@ -63,7 +65,7 @@ def test_401_raises_authentication_error_with_http_status_cause() -> None:
     )
 
 
-def test_429_preserves_retry_after_header() -> None:
+def test_429_normalizes_retry_after_seconds() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             429,
@@ -81,7 +83,114 @@ def test_429_preserves_retry_after_header() -> None:
     ):
         transport.get("https://api.vendor.test/customers/123")
 
-    assert exc_info.value.retry_after == "30"
+    assert exc_info.value.retry_after_seconds == 30.0
+
+
+def test_429_normalizes_retry_after_http_date() -> None:
+    fixed_now = datetime(
+        2026,
+        9,
+        27,
+        12,
+        0,
+        0,
+        tzinfo=UTC,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            headers={
+                "Retry-After": "Sun, 27 Sep 2026 12:00:30 GMT",
+            },
+            json={"detail": "too many requests"},
+        )
+
+    with (
+        HttpxTransport(
+            access_token="test-token",
+            timeout=10.0,
+            transport=httpx.MockTransport(handler),
+            now=lambda: fixed_now,
+        ) as transport,
+        pytest.raises(RateLimitError) as exc_info,
+    ):
+        transport.get("https://api.vendor.test/customers/123")
+
+    assert exc_info.value.retry_after_seconds == 30.0
+
+
+@pytest.mark.parametrize(
+    "retry_after",
+    [
+        None,
+        "",
+        "   ",
+        "-10",
+        "bananas",
+        "Fri, 31 Dec 1999 23:59:59",
+    ],
+)
+def test_429_ignores_invalid_retry_after(
+    retry_after: str | None,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        headers: dict[str, str] = {}
+
+        if retry_after is not None:
+            headers["Retry-After"] = retry_after
+
+        return httpx.Response(
+            429,
+            headers=headers,
+            json={"detail": "too many requests"},
+        )
+
+    with (
+        HttpxTransport(
+            access_token="test-token",
+            timeout=10.0,
+            transport=httpx.MockTransport(handler),
+        ) as transport,
+        pytest.raises(RateLimitError) as exc_info,
+    ):
+        transport.get("https://api.vendor.test/customers/123")
+
+    assert exc_info.value.retry_after_seconds is None
+
+
+def test_429_normalizes_past_retry_after_http_date_to_zero() -> None:
+    fixed_now = datetime(
+        2026,
+        9,
+        27,
+        12,
+        0,
+        30,
+        tzinfo=UTC,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            headers={
+                "Retry-After": "Sun, 27 Sep 2026 12:00:00 GMT",
+            },
+            json={"detail": "too many requests"},
+        )
+
+    with (
+        HttpxTransport(
+            access_token="test-token",
+            timeout=10.0,
+            transport=httpx.MockTransport(handler),
+            now=lambda: fixed_now,
+        ) as transport,
+        pytest.raises(RateLimitError) as exc_info,
+    ):
+        transport.get("https://api.vendor.test/customers/123")
+
+    assert exc_info.value.retry_after_seconds == 0.0
 
 
 def test_timeout_raises_upstream_timeout_error_with_timeout_cause() -> None:

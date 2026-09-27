@@ -13,7 +13,9 @@ The main goals of this project are to practice and demonstrate:
 - Custom exception hierarchies for external integrations.
 - Explicit configuration ownership.
 - Composition roots and dependency wiring.
-- Configurable retry mechanisms.
+- Configurable retry policies.
+- Exponential backoff and jitter.
+- Rate-limit-aware retry scheduling.
 - Iterators, generators, and lazy pagination.
 - Context managers and deterministic resource cleanup.
 - REST API integrations.
@@ -24,7 +26,7 @@ The main goals of this project are to practice and demonstrate:
 - Data validation and transformation.
 - Testing with `pytest`.
 - Mocks, fixtures, parametrization, and coverage.
-- Resilience patterns such as backoff, jitter, timeouts, and rate-limit handling.
+- Resilience patterns such as retries, backoff, jitter, timeouts, and rate-limit handling.
 - Continuous integration with GitHub Actions.
 - Docker and continuous deployment.
 - Cloud-oriented integration architecture.
@@ -162,7 +164,11 @@ The endpoint is intentionally implemented with a synchronous `def` handler becau
 
 #### Application lifespan
 
-The FastAPI lifespan owns initialization and cleanup of the vendor integration. Application startup initializes the required integration dependency and makes it available through typed application state. Initialization is fail-fast: if the required application dependencies cannot be created, startup fails instead of serving requests with a partially initialized application.
+The FastAPI lifespan owns initialization and cleanup of the vendor integration.
+
+Application startup initializes the required integration dependency and makes it available through typed application state.
+
+Initialization is fail-fast: if the required application dependencies cannot be created, startup fails instead of serving requests with a partially initialized application.
 
 On shutdown, the lifespan exits the managed integration context so the underlying `httpx.Client` is closed deterministically.
 
@@ -207,7 +213,7 @@ IntegrationError
 
 It intentionally does not inherit from `TransientIntegrationError`, because an invalid provider payload is not assumed to become valid through an immediate retry.
 
-This allows higher-level application code to distinguish integration-specific failures from unrelated programming errors while still applying common policies to transient failures.
+This allows higher-level application code to distinguish integration-specific failures from unrelated programming errors while still applying common resilience policies to transient failures.
 
 ### Transport abstraction
 
@@ -240,6 +246,9 @@ Current configuration includes:
 - Rejection of empty or whitespace-only access tokens.
 - Positive timeout validation.
 - A default timeout of `30.0` seconds.
+- Configurable maximum retry attempts.
+- Configurable initial exponential-backoff delay.
+- Configurable maximum accepted provider `Retry-After`.
 - Environment-variable loading.
 - Optional `.env` file loading.
 
@@ -249,6 +258,9 @@ Current environment variables are:
 VENDOR_BASE_URL
 VENDOR_ACCESS_TOKEN
 VENDOR_TIMEOUT
+VENDOR_RETRY_MAX_ATTEMPTS
+VENDOR_RETRY_BASE_DELAY
+VENDOR_RETRY_MAX_RETRY_AFTER_SECONDS
 ```
 
 Configuration parsing and validation are intentionally kept separate from dependency construction.
@@ -281,18 +293,36 @@ Conceptually:
 Settings
    |
    v
-HttpxTransport
+RetryPolicy
    |
    v
 VendorClient
+   |
+   v
+Transport
+```
+
+The concrete HTTP transport is also constructed and owned by the composition root:
+
+```text
+Settings
+   |
+   +--> RetryPolicy
+   |
+   +--> HttpxTransport
+            |
+            v
+        VendorClient
 ```
 
 Its current responsibilities include:
 
 - Extracting the real access-token value from `SecretStr`.
 - Converting `AnyHttpUrl` into the `str` expected by `VendorClient`.
+- Constructing `RetryPolicy` from validated settings.
 - Constructing `HttpxTransport`.
 - Constructing `VendorClient`.
+- Injecting the retry policy.
 - Injecting the concrete transport through the `Transport` abstraction.
 - Owning the HTTP transport lifecycle through a context manager.
 
@@ -308,6 +338,9 @@ with create_vendor_client(settings) as client:
 The lifecycle is:
 
 ```text
+create RetryPolicy
+        |
+        v
 create HttpxTransport
         |
         v
@@ -328,7 +361,7 @@ close httpx.Client
 
 Cleanup occurs both after normal execution and when an exception propagates from inside the context.
 
-This prevents Pydantic, environment loading, concrete HTTP construction, and resource-lifecycle concerns from leaking into `VendorClient`.
+This prevents Pydantic, environment loading, retry configuration, concrete HTTP construction, and resource-lifecycle concerns from leaking into `VendorClient`.
 
 ### HTTPX transport
 
@@ -351,32 +384,35 @@ Current behavior includes:
 - HTTP `500` and `502` handling as `UpstreamServerError`.
 - HTTP `503` handling as `UpstreamUnavailableError`.
 - HTTP `504` handling as `UpstreamTimeoutError`.
-- Preservation of `Retry-After` information for rate-limited responses.
+- HTTP-specific `Retry-After` parsing.
+- Normalization of valid `Retry-After` values into seconds.
 
-This keeps HTTP-specific concerns isolated from higher-level application logic.
+This keeps protocol-specific concerns isolated from higher-level application logic.
 
 ### Vendor client
 
-`VendorClient` is responsible for provider-specific request composition and pagination behavior while depending only on the `Transport` abstraction.
+`VendorClient` is responsible for provider-specific request composition, retry delegation for safe read operations, response validation, and pagination behavior.
 
 Current responsibilities include:
 
 - Base URL ownership.
 - URL construction.
-- Delegation of outbound requests to a `Transport`.
+- Delegation of outbound read requests through `RetryPolicy`.
+- Delegation of actual outbound I/O to a `Transport`.
 - Fetching individual vendor pages through `get_items_page()`.
 - Lazy multi-page traversal through `iter_items()`.
 - Validation of caller-provided page arguments.
 - Translation of invalid upstream payloads into semantic integration errors.
 - Pagination cycle detection.
 
-HTTP authentication, timeout configuration, environment-variable loading, configuration parsing, and transport lifecycle management are intentionally kept outside `VendorClient`.
+HTTP authentication, timeout configuration, environment-variable loading, retry configuration, configuration parsing, and transport lifecycle management are intentionally kept outside `VendorClient`.
 
 Conceptually:
 
 ```text
 VendorClient
 ├── base_url
+├── retry_policy
 ├── build_url()
 ├── get()
 ├── get_items_page()
@@ -384,7 +420,30 @@ VendorClient
 └── Transport
 ```
 
-This keeps the client focused on provider-specific behavior rather than infrastructure configuration.
+The current retry boundary is intentionally narrow:
+
+```text
+VendorClient.get()
+    ↓
+RetryPolicy.execute()
+    ↓
+Transport.get()
+```
+
+Payload validation happens after the retry-protected transport call.
+
+Therefore:
+
+```text
+transient transport failure
+→ retry may occur
+
+successful HTTP response with invalid payload
+→ InvalidUpstreamResponseError
+→ no retry
+```
+
+This keeps the client focused on provider-specific behavior while preserving a clear resilience boundary.
 
 ### Vendor pagination
 
@@ -617,46 +676,178 @@ ErrorResponse {code, detail}
 
 The project currently keeps FastAPI's standard `422` validation response rather than introducing a custom validation-error envelope.
 
-### Rate-limit handling
+### Retry policy
+
+The integration uses a configurable `RetryPolicy` for transient upstream failures.
+
+Retry behavior is intentionally kept outside `HttpxTransport`.
+
+```text
+HTTP / HTTPX
+    ↓
+HttpxTransport
+    ↓
+semantic integration exception
+    ↓
+RetryPolicy
+    ↓
+retry or propagate
+```
+
+`HttpxTransport` translates protocol-specific failures into semantic exceptions, while `RetryPolicy` owns resilience behavior.
+
+By default, the policy retries `TransientIntegrationError` subclasses:
+
+```text
+TransientIntegrationError
+├── RateLimitError
+├── UpstreamTimeoutError
+├── UpstreamConnectionError
+├── UpstreamServerError
+└── UpstreamUnavailableError
+```
+
+Permanent failures such as authentication errors, configuration errors, and invalid upstream payloads are not retried automatically.
+
+`max_attempts` represents the total number of executions, including the initial call.
+
+Therefore:
+
+```text
+max_attempts = 3
+
+attempt 1 → initial call
+attempt 2 → first retry
+attempt 3 → second and final retry
+```
+
+A policy configured with `max_attempts=1` performs only the initial execution and does not retry.
+
+The retry policy uses exponential backoff with full jitter.
+
+For attempt `N`, the local retry window is:
+
+```text
+base_delay * 2^(N - 1)
+```
+
+A random delay is then selected between zero and that window.
+
+For example:
+
+```text
+base_delay = 1.0
+
+attempt 1 failure
+→ jitter between 0 and 1 second
+
+attempt 2 failure
+→ jitter between 0 and 2 seconds
+
+attempt 3 failure
+→ jitter between 0 and 4 seconds
+```
+
+The final failed attempt is propagated immediately without an additional sleep.
+
+Injectable `sleep` and jitter functions keep retry tests deterministic and avoid real waiting during the test suite.
+
+Retries are currently applied to the vendor client's read operation:
+
+```text
+VendorClient.get()
+    ↓
+RetryPolicy.execute()
+    ↓
+Transport.get()
+```
+
+Retry eligibility depends on both the failure category and the operation semantics.
+
+Transient failures alone do not make every operation safe to retry.
+
+Future mutating operations such as `POST` requests should not automatically reuse this behavior unless the provider guarantees idempotency or supports mechanisms such as idempotency keys.
+
+### Rate limiting and Retry-After
 
 HTTP `429 Too Many Requests` responses from the upstream provider are translated into `RateLimitError`.
 
-When an upstream rate limit provides `Retry-After`, the API validates the value before exposing it to consumers.
+HTTP-specific `Retry-After` parsing belongs to `HttpxTransport`.
 
-Supported HTTP formats are:
+The transport accepts both standard forms:
 
-- Non-negative delay seconds.
-- Valid HTTP dates.
-
-Invalid values are omitted rather than corrected or propagated blindly.
-
-An upstream rate limit is exposed as `503 Service Unavailable`, because the limit belongs to the service-to-provider interaction rather than necessarily representing a rate limit imposed on the API consumer.
-
-More advanced retry scheduling, exponential backoff, and jitter remain part of a later resilience phase.
-
-### Retry decorator
-
-The project includes a configurable `retry` decorator.
-
-Example:
-
-```python
-@retry(
-    max_attempts=3,
-    retry_on=(TimeoutError, ConnectionError),
-)
-def call_vendor(): ...
+```text
+Retry-After: 30
+Retry-After: Sun, 27 Sep 2026 12:00:30 GMT
 ```
 
-Current behavior:
+and normalizes them into semantic retry metadata:
 
-- Validates that `max_attempts` is greater than zero.
-- Retries only explicitly configured exception types.
-- Immediately propagates non-retryable exceptions.
-- Re-raises the final retryable exception after attempts are exhausted.
-- Preserves function metadata using `functools.wraps`.
+```text
+RateLimitError.retry_after_seconds
+```
 
-Backoff, jitter, and more advanced retry scheduling are intentionally deferred to a later resilience phase.
+This prevents HTTP protocol details from leaking into the resilience layer.
+
+The normalized value is represented internally as a number of seconds or `None` when the header is missing or invalid.
+
+Past HTTP-date values are normalized to `0.0`, meaning that the provider no longer requires an additional wait beyond the client's own retry policy.
+
+When both local backoff and `Retry-After` are available, the effective delay is:
+
+```text
+max(local_backoff_with_jitter, retry_after_seconds)
+```
+
+The policy therefore never retries earlier than requested by the provider.
+
+`vendor_retry_max_retry_after_seconds` defines the maximum provider-requested delay that the process is willing to wait for.
+
+If the provider requests a larger delay, the policy stops retrying and propagates the existing `RateLimitError` instead of truncating the delay and retrying too early.
+
+Conceptually:
+
+```text
+Retry-After <= configured limit
+        ↓
+combine with local backoff
+        ↓
+sleep
+        ↓
+retry
+```
+
+while:
+
+```text
+Retry-After > configured limit
+        ↓
+no sleep
+        ↓
+no retry
+        ↓
+propagate RateLimitError
+```
+
+At the FastAPI boundary, the normalized semantic delay is converted back into a standard HTTP response header when available.
+
+For example:
+
+```text
+retry_after_seconds = 30.0
+→ Retry-After: 30
+```
+
+Fractional values are rounded upward:
+
+```text
+retry_after_seconds = 30.2
+→ Retry-After: 31
+```
+
+Rounding upward prevents downstream consumers from being instructed to retry earlier than the semantic delay represented internally.
+
+An upstream rate limit is exposed as `503 Service Unavailable`, because the limit belongs to the service-to-provider interaction rather than necessarily representing a rate limit imposed directly on the API consumer.
 
 ### Generators and lazy iteration
 
@@ -744,14 +935,30 @@ These examples illustrate how context managers provide deterministic resource cl
 
 ## Tests
 
-The current test suite covers:
+The current test suite covers application behavior, integration boundaries, resilience behavior, configuration, pagination, lifecycle management, and published API contracts.
 
-- Retry success on the first attempt.
-- Retry after transient failures.
-- Immediate propagation of non-retryable exceptions.
-- Exhausted retry attempts.
+### Retry coverage
+
+Retry coverage includes:
+
+- Success without retry.
+- Retry after transient integration failures.
+- Immediate propagation of non-transient errors.
+- Maximum-attempt exhaustion.
+- Exponential backoff windows.
+- Full jitter.
+- Deterministic injected sleeping.
+- `Retry-After` precedence over local backoff.
+- Local backoff precedence when larger.
+- Excessive `Retry-After` rejection.
 - Invalid retry configuration.
-- Preservation of decorated function metadata.
+- Vendor-client recovery after a transient failure.
+- Invalid upstream payloads are not retried.
+
+### Additional coverage
+
+The suite also covers:
+
 - Generator behavior across multiple pages.
 - Empty pagination scenarios.
 - Manual iterator behavior.
@@ -767,13 +974,16 @@ The current test suite covers:
 - HTTPX `MockTransport`-based integration tests.
 - Authentication error translation for HTTP `401`.
 - Rate-limit error translation for HTTP `429`.
+- `Retry-After` delay-seconds normalization.
+- `Retry-After` HTTP-date normalization.
+- Invalid `Retry-After` rejection.
+- Past `Retry-After` HTTP-date normalization.
 - Semantic upstream failure classification.
 - Public API exception-handler mappings.
 - Public error-response contract.
 - Prevention of internal error-message leakage.
-- Valid `Retry-After` delay-seconds propagation.
-- Valid `Retry-After` HTTP-date propagation.
-- Invalid `Retry-After` rejection.
+- Public `Retry-After` integer propagation.
+- Public `Retry-After` upward rounding.
 - OpenAPI documentation for `502`, `503`, and `504` responses.
 - Permanent HTTP error translation.
 - Timeout error translation.
@@ -782,10 +992,13 @@ The current test suite covers:
 - Settings URL validation.
 - Default timeout configuration.
 - Positive timeout validation.
+- Default retry configuration.
+- Retry-setting validation.
 - Rejection of empty access tokens.
 - Rejection of whitespace-only access tokens.
 - Secret-value preservation through `SecretStr`.
 - Composition-root dependency wiring.
+- Composition-root retry-policy wiring.
 - Explicit `SecretStr` to `str` adaptation.
 - `AnyHttpUrl` to `str` adaptation.
 - Transport lifecycle cleanup.
@@ -818,7 +1031,7 @@ The current test suite covers:
 Current test count:
 
 ```text
-89 tests
+106 tests
 ```
 
 Run the suite with:
@@ -985,6 +1198,9 @@ Example variables:
 VENDOR_BASE_URL=https://api.example.com
 VENDOR_ACCESS_TOKEN=replace-with-local-development-value
 VENDOR_TIMEOUT=30
+VENDOR_RETRY_MAX_ATTEMPTS=3
+VENDOR_RETRY_BASE_DELAY=0.5
+VENDOR_RETRY_MAX_RETRY_AFTER_SECONDS=60
 ```
 
 Configuration rules:
@@ -1003,7 +1219,29 @@ VENDOR_TIMEOUT
 → optional
 → defaults to 30.0
 → must be greater than 0
+
+VENDOR_RETRY_MAX_ATTEMPTS
+→ optional
+→ defaults to 3
+→ total executions, including the initial call
+→ must be at least 1
+
+VENDOR_RETRY_BASE_DELAY
+→ optional
+→ defaults to 0.5
+→ initial exponential-backoff window in seconds
+→ must be greater than or equal to 0
+
+VENDOR_RETRY_MAX_RETRY_AFTER_SECONDS
+→ optional
+→ defaults to 60.0
+→ maximum Retry-After delay accepted by the retry policy
+→ must be greater than 0
 ```
+
+`VENDOR_RETRY_MAX_RETRY_AFTER_SECONDS` does not represent the maximum delay for every retry.
+
+It specifically represents the maximum provider-requested `Retry-After` delay that this process is willing to wait for before abandoning automatic retry.
 
 Real secrets must be provided through environment variables or a proper secret-management system.
 
@@ -1043,6 +1281,8 @@ The project follows several principles that will guide future changes:
 - Keep configuration parsing separate from dependency construction.
 - Centralize concrete dependency wiring in a composition root.
 - Keep HTTP-specific behavior behind transport abstractions.
+- Normalize protocol-specific data at the protocol boundary.
+- Keep resilience decisions outside the HTTP transport.
 - Keep Pydantic-specific types at the configuration boundary.
 - Use dedicated schemas to validate upstream provider contracts.
 - Keep upstream provider schemas separate from public API response schemas.
@@ -1050,7 +1290,11 @@ The project follows several principles that will guide future changes:
 - Translate invalid upstream payloads into semantic integration errors.
 - Do not propagate upstream HTTP status codes blindly across API boundaries.
 - Keep internal diagnostic messages separate from public error messages.
-- Retry only failures that are actually retryable.
+- Retry only failures that are actually transient and safe to retry.
+- Treat retry eligibility as a combination of failure category and operation semantics.
+- Do not automatically apply read-operation retry behavior to future mutating operations.
+- Respect provider `Retry-After` instructions without retrying earlier than requested.
+- Avoid unbounded provider-directed waits inside the retry policy.
 - Never silently swallow exceptions.
 - Preserve original exceptions and tracebacks when possible.
 - Avoid hardcoding credentials.
@@ -1071,6 +1315,7 @@ The project follows several principles that will guide future changes:
 - Patch dependencies where they are looked up by the code under test.
 - Use HTTPX `MockTransport` to test HTTP behavior without real network calls.
 - Use pytest fixtures and `monkeypatch` to isolate test state.
+- Inject time- and randomness-related side effects when deterministic tests are required.
 - Automate repeatable quality checks through continuous integration.
 - Keep integrations replaceable and easy to isolate in tests.
 - Automate safe formatting and lint fixes during local development.
@@ -1095,8 +1340,16 @@ The project will evolve incrementally.
 - [x] Composition root for integration dependency wiring.
 - [x] Explicit configuration-type adaptation at the composition boundary.
 - [x] Composition-root transport lifecycle management.
-- [x] Configurable retry decorator.
-- [x] Retry behavior tests.
+- [x] Configurable retry policy.
+- [x] Semantic transient-error classification.
+- [x] Exponential backoff.
+- [x] Full jitter.
+- [x] Retry-After normalization.
+- [x] Retry-After-aware scheduling.
+- [x] Deterministic retry tests.
+- [x] Composition-root retry configuration.
+- [x] Vendor-client retry integration.
+- [x] Retry/non-retry collaboration tests.
 - [x] Generator fundamentals.
 - [x] Manual iterator implementation.
 - [x] Pagination and iterator tests.
@@ -1106,7 +1359,7 @@ The project will evolve incrementally.
 - [x] Bearer authentication headers.
 - [x] HTTP exception translation.
 - [x] HTTP timeout and network error translation.
-- [x] Rate-limit handling with `Retry-After`.
+- [x] Rate-limit handling with normalized `Retry-After`.
 - [x] Transient error classification for `500`, `502`, `503`, and `504`.
 - [x] `MockTransport`-based HTTP tests.
 - [x] Settings validation tests.
@@ -1148,8 +1401,10 @@ The project will evolve incrementally.
 
 - [ ] Data transformation and validation.
 - [ ] Advanced pytest fixtures and mocks.
-- [ ] Retry backoff and jitter.
 - [ ] Client-side rate limiting.
+- [ ] Retry budget / retry deadline.
+- [ ] Idempotency-key support for safe retries of mutating operations.
+- [ ] Explicit retry semantics for future mutating operations.
 - [ ] GraphQL integration.
 - [ ] gRPC integration.
 - [ ] Docker.
@@ -1164,6 +1419,8 @@ This repository is under active development and is intentionally built in small,
 
 Each phase adds a focused backend concept together with tests before moving to the next topic.
 
-The current implementation includes validated application configuration with Pydantic Settings, explicit secret handling with `SecretStr`, a composition root that wires and owns integration resources, a concrete HTTPX transport with Bearer authentication and deterministic cleanup, semantic upstream exception classification, rate-limit handling, safe `Retry-After` propagation, strict upstream pagination schemas, lazy vendor pagination, empty-page handling, cycle detection, non-monotonic pagination support, invalid upstream-response translation, separate upstream and public response models, a paginated `GET /vendor/items?page=N` API contract, FastAPI request-query validation, stable public integration error responses, OpenAPI documentation, isolated API tests through dependency overrides, and a GitHub Actions CI pipeline that verifies formatting, linting, tests, coverage, and test reports.
+The current implementation includes validated application configuration with Pydantic Settings, explicit secret handling with `SecretStr`, retry configuration through environment-backed settings, a composition root that wires and owns integration resources, composition-root injection of a configurable resilience policy, a concrete HTTPX transport with Bearer authentication and deterministic cleanup, semantic upstream exception classification, configurable transient-failure retries, exponential backoff with full jitter, normalized `Retry-After` handling, `Retry-After`-aware scheduling, bounded provider-directed retry waits, strict upstream pagination schemas, lazy vendor pagination, empty-page handling, cycle detection, non-monotonic pagination support, invalid upstream-response translation, separate upstream and public response models, a paginated `GET /vendor/items?page=N` API contract, FastAPI request-query validation, stable public integration error responses, OpenAPI documentation, isolated API tests through dependency overrides, deterministic retry tests, collaboration tests across `VendorClient` and `RetryPolicy`, and a GitHub Actions CI pipeline that verifies formatting, linting, tests, coverage, and test reports.
 
-The current suite contains 89 passing tests.
+Retries are currently applied only to the vendor client's read operation. The project intentionally does not assume that future mutating operations are safe to retry merely because a failure is transient. Safe retries for future `POST`, `PUT`, or `DELETE` operations will require operation-specific semantics, provider guarantees, or mechanisms such as idempotency keys.
+
+The current suite contains 106 passing tests.

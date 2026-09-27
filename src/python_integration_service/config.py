@@ -6,6 +6,12 @@ class Settings(BaseSettings):
     vendor_base_url: AnyHttpUrl
     vendor_access_token: SecretStr
     vendor_timeout: float = Field(default=30.0, gt=0)
+    vendor_retry_max_attempts: int = Field(default=3, ge=1)
+    vendor_retry_base_delay: float = Field(default=0.5, ge=0)
+    vendor_retry_max_retry_after_seconds: float = Field(
+        default=60.0,
+        gt=0,
+    )
 
     model_config = SettingsConfigDict(
         env_file=".env",
