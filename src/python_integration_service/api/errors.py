@@ -7,6 +7,7 @@ from python_integration_service.api.schemas import ErrorResponse
 from python_integration_service.integrations.exceptions import (
     AuthenticationError,
     IntegrationError,
+    InvalidUpstreamResponseError,
     RateLimitError,
     UpstreamConnectionError,
     UpstreamServerError,
@@ -47,6 +48,19 @@ async def authentication_error_handler(
         content=ErrorResponse(
             code="upstream_authentication_error",
             detail="The upstream service could not authenticate the request.",
+        ).model_dump(mode="json"),
+    )
+
+
+async def invalid_upstream_response_error_handler(
+    request: Request,
+    exc: Exception,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        content=ErrorResponse(
+            code="upstream_invalid_response",
+            detail="The upstream service returned an invalid response.",
         ).model_dump(mode="json"),
     )
 
@@ -144,6 +158,10 @@ def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(
         AuthenticationError,
         authentication_error_handler,
+    )
+    app.add_exception_handler(
+        InvalidUpstreamResponseError,
+        invalid_upstream_response_error_handler,
     )
     app.add_exception_handler(
         RateLimitError,

@@ -10,6 +10,7 @@ from python_integration_service.dependencies import get_vendor_client
 from python_integration_service.integrations.exceptions import (
     AuthenticationError,
     IntegrationError,
+    InvalidUpstreamResponseError,
     RateLimitError,
     UpstreamConnectionError,
     UpstreamServerError,
@@ -17,6 +18,10 @@ from python_integration_service.integrations.exceptions import (
     UpstreamUnavailableError,
 )
 from python_integration_service.integrations.vendor_client import VendorClient
+from python_integration_service.integrations.vendor_schemas import (
+    ItemsPage,
+    VendorItem,
+)
 
 
 @pytest.fixture
@@ -36,18 +41,19 @@ def test_app(vendor_client: MagicMock) -> FastAPI:
     return app
 
 
-def test_get_vendor_items_returns_vendor_response(
+def test_get_vendor_items_returns_first_page_by_default(
     test_app: FastAPI,
     vendor_client: MagicMock,
 ) -> None:
-    vendor_client.get.return_value = {
-        "items": [
-            {
-                "id": 1,
-                "name": "Item 1",
-            },
-        ]
-    }
+    vendor_client.get_items_page.return_value = ItemsPage(
+        items=[
+            VendorItem(
+                id=1,
+                name="Item 1",
+            )
+        ],
+        next_page=2,
+    )
 
     with TestClient(test_app) as client:
         response = client.get("/vendor/items")
@@ -58,11 +64,56 @@ def test_get_vendor_items_returns_vendor_response(
             {
                 "id": 1,
                 "name": "Item 1",
-            },
-        ]
+            }
+        ],
+        "next_page": 2,
     }
 
-    vendor_client.get.assert_called_once_with("/items")
+    vendor_client.get_items_page.assert_called_once_with(page=1)
+
+
+def test_get_vendor_items_requests_selected_page(
+    test_app: FastAPI,
+    vendor_client: MagicMock,
+) -> None:
+    vendor_client.get_items_page.return_value = ItemsPage(
+        items=[],
+        next_page=None,
+    )
+
+    with TestClient(test_app) as client:
+        response = client.get("/vendor/items?page=3")
+
+    assert response.status_code == status.HTTP_200_OK
+    assert response.json() == {
+        "items": [],
+        "next_page": None,
+    }
+
+    vendor_client.get_items_page.assert_called_once_with(page=3)
+
+
+@pytest.mark.parametrize(
+    "page",
+    [
+        0,
+        -1,
+    ],
+)
+def test_get_vendor_items_rejects_invalid_page_query(
+    test_app: FastAPI,
+    vendor_client: MagicMock,
+    page: int,
+) -> None:
+    with TestClient(test_app) as client:
+        response = client.get(
+            "/vendor/items",
+            params={"page": page},
+        )
+
+    assert response.status_code == status.HTTP_422_UNPROCESSABLE_CONTENT
+
+    vendor_client.get_items_page.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -78,6 +129,12 @@ def test_get_vendor_items_returns_vendor_response(
             status.HTTP_502_BAD_GATEWAY,
             "upstream_authentication_error",
             "The upstream service could not authenticate the request.",
+        ),
+        (
+            InvalidUpstreamResponseError("provider payload failed internal validation"),
+            status.HTTP_502_BAD_GATEWAY,
+            "upstream_invalid_response",
+            "The upstream service returned an invalid response.",
         ),
         (
             RateLimitError(
@@ -130,7 +187,7 @@ def test_integration_errors_are_translated_to_public_http_responses(
     expected_code: str,
     expected_detail: str,
 ) -> None:
-    vendor_client.get.side_effect = integration_exception
+    vendor_client.get_items_page.side_effect = integration_exception
 
     with TestClient(test_app) as client:
         response = client.get("/vendor/items")
@@ -143,14 +200,14 @@ def test_integration_errors_are_translated_to_public_http_responses(
 
     assert str(integration_exception) not in response.text
 
-    vendor_client.get.assert_called_once_with("/items")
+    vendor_client.get_items_page.assert_called_once_with(page=1)
 
 
 def test_rate_limit_error_preserves_valid_retry_after_seconds(
     test_app: FastAPI,
     vendor_client: MagicMock,
 ) -> None:
-    vendor_client.get.side_effect = RateLimitError(
+    vendor_client.get_items_page.side_effect = RateLimitError(
         "provider rate limit exceeded",
         retry_after="30",
     )
@@ -168,7 +225,7 @@ def test_rate_limit_error_preserves_valid_retry_after_http_date(
 ) -> None:
     retry_after = "Fri, 31 Dec 1999 23:59:59 GMT"
 
-    vendor_client.get.side_effect = RateLimitError(
+    vendor_client.get_items_page.side_effect = RateLimitError(
         "provider rate limit exceeded",
         retry_after=retry_after,
     )
@@ -196,7 +253,7 @@ def test_rate_limit_error_omits_invalid_retry_after(
     vendor_client: MagicMock,
     retry_after: str | None,
 ) -> None:
-    vendor_client.get.side_effect = RateLimitError(
+    vendor_client.get_items_page.side_effect = RateLimitError(
         "provider rate limit exceeded",
         retry_after=retry_after,
     )
@@ -226,3 +283,17 @@ def test_vendor_endpoint_documents_integration_error_responses(
     assert responses["502"]["content"]["application/json"]["schema"] == error_schema
     assert responses["503"]["content"]["application/json"]["schema"] == error_schema
     assert responses["504"]["content"]["application/json"]["schema"] == error_schema
+
+
+def test_vendor_endpoint_documents_paginated_success_response(
+    test_app: FastAPI,
+) -> None:
+    openapi = test_app.openapi()
+
+    response_schema = openapi["paths"]["/vendor/items"]["get"]["responses"]["200"][
+        "content"
+    ]["application/json"]["schema"]
+
+    assert response_schema == {
+        "$ref": "#/components/schemas/ItemsPageResponse",
+    }

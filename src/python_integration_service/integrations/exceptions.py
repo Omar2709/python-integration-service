@@ -10,6 +10,10 @@ class AuthenticationError(IntegrationError):
     """Raised when authentication with the provider fails."""
 
 
+class InvalidUpstreamResponseError(IntegrationError):
+    """Raised when the upstream service returns an invalid response payload."""
+
+
 class TransientIntegrationError(IntegrationError):
     """Base exception for temporary integration failures."""
 

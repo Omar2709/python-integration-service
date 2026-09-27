@@ -85,7 +85,8 @@ python-integration-service/
 │           ├── resource_context.py
 │           ├── retry.py
 │           ├── transport.py
-│           └── vendor_client.py
+│           ├── vendor_client.py
+│           └── vendor_schemas.py
 ├── tests/
 │   ├── api/
 │   │   └── test_vendor.py
@@ -95,7 +96,8 @@ python-integration-service/
 │   │   ├── test_page_iterator.py
 │   │   ├── test_pagination.py
 │   │   ├── test_resource_context.py
-│   │   └── test_retry.py
+│   │   ├── test_retry.py
+│   │   └── test_vendor_client.py
 │   ├── test_composition.py
 │   ├── test_config.py
 │   ├── test_dependencies.py
@@ -117,11 +119,11 @@ Project-specific VS Code configuration is versioned for reproducible development
 
 ### FastAPI application
 
-The project includes a FastAPI application with a health-check endpoint and a vendor router.
+The project includes a FastAPI application with a health-check endpoint and a paginated vendor router.
 
 ```text
 GET /health
-GET /vendor/items
+GET /vendor/items?page=N
 ```
 
 Current behavior includes:
@@ -131,11 +133,30 @@ Current behavior includes:
 - Typed access to application state.
 - FastAPI dependency injection.
 - Vendor router behavior.
+- Public vendor pagination.
+- Request-query validation.
 - Dependency overrides for isolated API tests.
 
 #### `GET /vendor/items`
 
-`GET /vendor/items` exposes vendor item retrieval through the application's injected vendor client.
+`GET /vendor/items` exposes paginated vendor item retrieval through the application's injected vendor client.
+
+The endpoint accepts a positive `page` query parameter:
+
+```text
+GET /vendor/items?page=1
+```
+
+When the query parameter is omitted, page `1` is used by default.
+
+Invalid page values such as:
+
+```text
+?page=0
+?page=-1
+```
+
+are rejected by FastAPI request validation with the standard `422 Unprocessable Content` response before any upstream I/O occurs.
 
 The endpoint is intentionally implemented with a synchronous `def` handler because the current transport uses synchronous `httpx.Client`. This keeps the route aligned with the integration's current synchronous I/O model.
 
@@ -156,6 +177,7 @@ Current exception types include:
 - `IntegrationError`
 - `ConfigurationError`
 - `AuthenticationError`
+- `InvalidUpstreamResponseError`
 - `TransientIntegrationError`
 - `RateLimitError`
 - `UpstreamTimeoutError`
@@ -170,6 +192,7 @@ IntegrationError
 |
 +-- ConfigurationError
 +-- AuthenticationError
++-- InvalidUpstreamResponseError
 |
 +-- TransientIntegrationError
     |
@@ -179,6 +202,10 @@ IntegrationError
     +-- UpstreamServerError
     +-- UpstreamUnavailableError
 ```
+
+`InvalidUpstreamResponseError` represents a provider response that was successfully received at the transport level but does not satisfy the integration contract.
+
+It intentionally does not inherit from `TransientIntegrationError`, because an invalid provider payload is not assumed to become valid through an immediate retry.
 
 This allows higher-level application code to distinguish integration-specific failures from unrelated programming errors while still applying common policies to transient failures.
 
@@ -330,13 +357,18 @@ This keeps HTTP-specific concerns isolated from higher-level application logic.
 
 ### Vendor client
 
-`VendorClient` is responsible for provider-specific request composition while depending only on the `Transport` abstraction.
+`VendorClient` is responsible for provider-specific request composition and pagination behavior while depending only on the `Transport` abstraction.
 
 Current responsibilities include:
 
 - Base URL ownership.
 - URL construction.
 - Delegation of outbound requests to a `Transport`.
+- Fetching individual vendor pages through `get_items_page()`.
+- Lazy multi-page traversal through `iter_items()`.
+- Validation of caller-provided page arguments.
+- Translation of invalid upstream payloads into semantic integration errors.
+- Pagination cycle detection.
 
 HTTP authentication, timeout configuration, environment-variable loading, configuration parsing, and transport lifecycle management are intentionally kept outside `VendorClient`.
 
@@ -346,10 +378,102 @@ Conceptually:
 VendorClient
 ├── base_url
 ├── build_url()
+├── get()
+├── get_items_page()
+├── iter_items()
 └── Transport
 ```
 
 This keeps the client focused on provider-specific behavior rather than infrastructure configuration.
+
+### Vendor pagination
+
+The vendor integration supports both page-level access and lazy iteration.
+
+```python
+page = vendor_client.get_items_page(page=1)
+
+for item in vendor_client.iter_items():
+    ...
+```
+
+`get_items_page()` is the lower-level pagination primitive, while `iter_items()` provides lazy traversal across pages.
+
+The lazy iterator reuses `get_items_page()` rather than duplicating the outbound request and validation logic.
+
+Upstream pagination payloads are validated with dedicated Pydantic models.
+
+The upstream models are:
+
+```text
+VendorItem
+ItemsPage
+```
+
+Validation policy:
+
+- Required fields are validated strictly.
+- Type coercion is disabled for consumed fields.
+- Unknown additional fields are ignored for forward compatibility.
+- `next_page` must be a positive integer or `None`.
+- Invalid upstream payloads are translated into `InvalidUpstreamResponseError`.
+- Cyclic pagination is detected before requesting an already visited page.
+- Empty pages do not imply the end of pagination; `next_page` is the source of truth.
+- Non-monotonic page sequences are allowed when they do not revisit an already processed page.
+
+For example, this sequence is valid:
+
+```text
+1 → 3 → 2 → None
+```
+
+because every page identifier is valid and no page is revisited.
+
+This sequence is rejected:
+
+```text
+1 → 3 → 2 → 3
+```
+
+because it contains a pagination cycle.
+
+The client does not assume that page numbers must be strictly increasing unless the provider contract explicitly requires that behavior.
+
+### Paginated vendor API
+
+The public endpoint exposes one vendor page per request:
+
+```text
+GET /vendor/items?page=1
+```
+
+Returning one page keeps request latency, memory consumption, and upstream call count bounded.
+
+The endpoint uses `VendorClient.get_items_page()` rather than consuming the full `iter_items()` generator.
+
+This prevents a normal API request from loading an arbitrarily large vendor dataset into memory or making an unbounded number of upstream requests before responding.
+
+The public API uses its own response models rather than exposing upstream provider schemas directly.
+
+Conceptually:
+
+```text
+VendorItem / ItemsPage
+        |
+        v
+explicit adaptation
+        |
+        v
+ItemResponse / ItemsPageResponse
+```
+
+The upstream models represent what the provider promises to return.
+
+The public API models represent what this service promises to its consumers.
+
+This allows the provider contract and the public API contract to evolve independently.
+
+For example, a future provider field rename could be handled inside the explicit adaptation layer without necessarily changing the public API contract.
 
 ### Authentication
 
@@ -358,7 +482,7 @@ Outbound vendor requests support Bearer token authentication.
 Conceptually:
 
 ```http
-Authorization: Bearer \<access-token>
+Authorization: Bearer <access-token>
 ```
 
 The access token is loaded through `Settings`, represented as `SecretStr`, explicitly extracted in the composition root, and passed to `HttpxTransport`.
@@ -394,6 +518,9 @@ HTTPX network / connection failure
 
 504 upstream
   -> UpstreamTimeoutError
+
+Invalid upstream payload
+  -> InvalidUpstreamResponseError
 ```
 
 The FastAPI boundary then translates integration exceptions into the public API contract:
@@ -401,27 +528,40 @@ The FastAPI boundary then translates integration exceptions into the public API 
 ```text
 AuthenticationError
   -> 502 Bad Gateway
+  -> upstream_authentication_error
+
+InvalidUpstreamResponseError
+  -> 502 Bad Gateway
+  -> upstream_invalid_response
 
 RateLimitError
   -> 503 Service Unavailable
+  -> upstream_rate_limited
 
 UpstreamConnectionError
   -> 502 Bad Gateway
+  -> upstream_connection_error
 
 UpstreamServerError
   -> 502 Bad Gateway
+  -> upstream_server_error
 
 UpstreamUnavailableError
   -> 503 Service Unavailable
+  -> upstream_unavailable
 
 UpstreamTimeoutError
   -> 504 Gateway Timeout
+  -> upstream_timeout
 
 IntegrationError
   -> 502 Bad Gateway
+  -> upstream_integration_error
 ```
 
 Upstream status codes are not propagated blindly. The public response reflects the meaning of the failure from the perspective of this API's consumers.
+
+A provider response can also fail even when its HTTP status is successful. For example, an HTTP `200` response containing an invalid pagination payload is translated into `InvalidUpstreamResponseError`.
 
 ### Public error contract
 
@@ -434,9 +574,48 @@ Integration failures exposed by the API use a stable error response:
 }
 ```
 
+Invalid provider responses use:
+
+```json
+{
+  "code": "upstream_invalid_response",
+  "detail": "The upstream service returned an invalid response."
+}
+```
+
 The public error contract is modeled with Pydantic through `ErrorResponse` and documented in OpenAPI for `502`, `503`, and `504` responses.
 
-Internal exception messages are not returned directly to API consumers, reducing accidental information leakage.
+Internal exception messages and Pydantic validation details are not returned directly to API consumers, reducing accidental information leakage.
+
+The public error code communicates a stable failure category while implementation-specific validation details remain inside the integration boundary.
+
+FastAPI request-validation errors remain separate from the integration-error contract.
+
+Conceptually:
+
+```text
+Invalid consumer request
+        |
+        v
+FastAPI RequestValidationError
+        |
+        v
+422 standard validation response
+```
+
+while:
+
+```text
+Upstream / integration failure
+        |
+        v
+semantic integration exception
+        |
+        v
+ErrorResponse {code, detail}
+```
+
+The project currently keeps FastAPI's standard `422` validation response rather than introducing a custom validation-error envelope.
 
 ### Rate-limit handling
 
@@ -481,11 +660,52 @@ Backoff, jitter, and more advanced retry scheduling are intentionally deferred t
 
 ### Generators and lazy iteration
 
-`iter_items` demonstrates lazy iteration using a generator.
+`VendorClient.iter_items()` applies Python generator semantics to real upstream pagination.
 
-Instead of building one large collection in memory, values are produced progressively.
+Instead of building one large collection in memory, vendor items are produced progressively as iteration advances.
 
-This pattern will later be applied to paginated third-party APIs.
+Pages are fetched only when the consumer requests additional items.
+
+Conceptually:
+
+```text
+next(item)
+   |
+   v
+fetch current page if required
+   |
+   v
+yield item
+   |
+   v
+follow next_page only when iteration continues
+```
+
+The generator:
+
+- Starts from page `1` by default.
+- Supports an explicit positive `start_page`.
+- Fetches pages lazily.
+- Skips empty intermediate pages.
+- Stops when `next_page` is `None`.
+- Detects pagination cycles.
+- Allows non-monotonic unvisited page sequences.
+- Does not materialize the complete vendor dataset in memory.
+
+Because `iter_items()` contains `yield`, calling it creates a generator object without immediately executing its body.
+
+Execution begins when iteration starts, for example through:
+
+```python
+next(items)
+```
+
+or:
+
+```python
+for item in items:
+    ...
+```
 
 ### Manual iterator
 
@@ -576,11 +796,29 @@ The current test suite covers:
 - FastAPI dependency injection.
 - Vendor router behavior.
 - Dependency overrides for isolated API tests.
+- Strict upstream pagination schema validation.
+- Forward-compatible handling of additional upstream fields.
+- Invalid upstream payload translation.
+- Lazy multi-page fetching.
+- Empty intermediate pages.
+- Empty final pages.
+- Cyclic pagination detection.
+- Non-monotonic unvisited pagination.
+- Positive page metadata validation.
+- Invalid direct page argument validation.
+- Invalid lazy-iteration start-page validation.
+- Public paginated vendor endpoint.
+- Default public page selection.
+- Explicit public page selection.
+- Public/upstream schema separation.
+- Invalid public page query validation.
+- OpenAPI documentation for the paginated success response.
+- Public `upstream_invalid_response` error translation.
 
 Current test count:
 
 ```text
-69 tests
+89 tests
 ```
 
 Run the suite with:
@@ -649,9 +887,25 @@ The VS Code shortcuts improve the local development workflow but do not replace 
 Before committing a completed development block, run:
 
 ```bash
+uv run ruff format --check .
 uv run ruff check .
 uv run pytest -v
 git diff --check
+git status --short
+```
+
+Review the full working-tree diff before staging:
+
+```bash
+git diff
+```
+
+Then stage and validate the exact commit contents:
+
+```bash
+git add .
+git diff --cached --check
+git diff --cached
 ```
 
 ## Continuous Integration
@@ -739,10 +993,12 @@ Configuration rules:
 VENDOR_BASE_URL
 → required
 → valid HTTP/HTTPS URL
+
 VENDOR_ACCESS_TOKEN
 → required
 → cannot be empty
 → cannot contain only whitespace
+
 VENDOR_TIMEOUT
 → optional
 → defaults to 30.0
@@ -766,9 +1022,14 @@ Then verify the available endpoints:
 ```text
 http://127.0.0.1:8000/health
 http://127.0.0.1:8000/vendor/items
+http://127.0.0.1:8000/vendor/items?page=1
 ```
 
-`GET /health` provides the application health check. `GET /vendor/items` uses the vendor integration initialized by the FastAPI lifespan.
+`GET /health` provides the application health check.
+
+`GET /vendor/items` returns the first vendor page by default.
+
+`GET /vendor/items?page=N` retrieves a selected positive page through the paginated vendor integration initialized by the FastAPI lifespan.
 
 The vendor endpoint is implemented with `def` because the current `HttpxTransport` uses synchronous `httpx.Client`.
 
@@ -783,7 +1044,10 @@ The project follows several principles that will guide future changes:
 - Centralize concrete dependency wiring in a composition root.
 - Keep HTTP-specific behavior behind transport abstractions.
 - Keep Pydantic-specific types at the configuration boundary.
+- Use dedicated schemas to validate upstream provider contracts.
+- Keep upstream provider schemas separate from public API response schemas.
 - Translate external-library failures into domain-specific integration errors.
+- Translate invalid upstream payloads into semantic integration errors.
 - Do not propagate upstream HTTP status codes blindly across API boundaries.
 - Keep internal diagnostic messages separate from public error messages.
 - Retry only failures that are actually retryable.
@@ -794,10 +1058,15 @@ The project follows several principles that will guide future changes:
 - Validate configuration early.
 - Make secret extraction explicit and localized.
 - Validate externally supplied response metadata before exposing it downstream.
+- Treat provider pagination metadata as the source of truth for traversal.
+- Detect pagination cycles rather than assuming page numbers are strictly increasing.
 - Prefer lazy processing when large datasets do not need to be fully loaded into memory.
+- Keep public API requests bounded rather than automatically materializing complete upstream datasets.
+- Validate caller input before performing unnecessary I/O.
 - Use context managers for deterministic cleanup of managed resources.
 - Make resource ownership and lifecycle explicit.
 - Write tests around observable behavior rather than implementation details.
+- Use tests as executable documentation for intentional architectural behavior.
 - Test both runtime behavior and published OpenAPI contracts when they are part of the API surface.
 - Patch dependencies where they are looked up by the code under test.
 - Use HTTPX `MockTransport` to test HTTP behavior without real network calls.
@@ -861,10 +1130,22 @@ The project will evolve incrementally.
 - [x] Coverage and JUnit report generation in CI.
 - [x] VS Code Ruff format and fix automation.
 - [x] Repository-wide Ruff build task.
+- [x] Upstream pagination schemas.
+- [x] Strict vendor-response validation.
+- [x] Lazy vendor pagination.
+- [x] Pagination cycle protection.
+- [x] Empty-page pagination handling.
+- [x] Non-monotonic unvisited pagination.
+- [x] Positive pagination metadata validation.
+- [x] Invalid upstream-response handling.
+- [x] Public `upstream_invalid_response` error translation.
+- [x] Paginated public vendor endpoint.
+- [x] Public page-query validation.
+- [x] Separate upstream and public pagination models.
+- [x] OpenAPI paginated-success documentation.
 
 ### Next
 
-- [ ] Apply lazy iteration to a real paginated client flow.
 - [ ] Data transformation and validation.
 - [ ] Advanced pytest fixtures and mocks.
 - [ ] Retry backoff and jitter.
@@ -883,6 +1164,6 @@ This repository is under active development and is intentionally built in small,
 
 Each phase adds a focused backend concept together with tests before moving to the next topic.
 
-The current implementation includes validated application configuration with Pydantic Settings, explicit secret handling with `SecretStr`, a composition root that wires and owns integration resources, a focused `VendorClient`, a concrete HTTPX transport with authentication and deterministic cleanup, semantic upstream exception classification, FastAPI integration error translation, a stable public error-response contract, safe `Retry-After` propagation, OpenAPI documentation for integration failures, FastAPI lifespan-managed initialization and cleanup, typed application state, dependency injection, the `GET /vendor/items` router flow, isolated API tests through dependency overrides, and a GitHub Actions CI pipeline that verifies formatting, linting, tests, coverage, and test reports.
+The current implementation includes validated application configuration with Pydantic Settings, explicit secret handling with `SecretStr`, a composition root that wires and owns integration resources, a concrete HTTPX transport with Bearer authentication and deterministic cleanup, semantic upstream exception classification, rate-limit handling, safe `Retry-After` propagation, strict upstream pagination schemas, lazy vendor pagination, empty-page handling, cycle detection, non-monotonic pagination support, invalid upstream-response translation, separate upstream and public response models, a paginated `GET /vendor/items?page=N` API contract, FastAPI request-query validation, stable public integration error responses, OpenAPI documentation, isolated API tests through dependency overrides, and a GitHub Actions CI pipeline that verifies formatting, linting, tests, coverage, and test reports.
 
-The current suite contains 69 passing tests.
+The current suite contains 89 passing tests.
