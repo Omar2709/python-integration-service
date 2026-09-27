@@ -68,6 +68,8 @@ python-integration-service/
 │       ├── __init__.py
 │       ├── api/
 │       │   ├── __init__.py
+│       │   ├── errors.py
+│       │   ├── schemas.py
 │       │   └── vendor.py
 │       ├── composition.py
 │       ├── config.py
@@ -153,10 +155,31 @@ Current exception types include:
 - `IntegrationError`
 - `ConfigurationError`
 - `AuthenticationError`
-- `RateLimitError`
 - `TransientIntegrationError`
+- `RateLimitError`
+- `UpstreamTimeoutError`
+- `UpstreamConnectionError`
+- `UpstreamServerError`
+- `UpstreamUnavailableError`
 
-This allows higher-level application code to distinguish integration-specific failures from unrelated programming errors.
+Transient integration failures share a common base while preserving semantic subtypes:
+
+```text
+IntegrationError
+|
++-- ConfigurationError
++-- AuthenticationError
+|
++-- TransientIntegrationError
+    |
+    +-- RateLimitError
+    +-- UpstreamTimeoutError
+    +-- UpstreamConnectionError
+    +-- UpstreamServerError
+    +-- UpstreamUnavailableError
+```
+
+This allows higher-level application code to distinguish integration-specific failures from unrelated programming errors while still applying common policies to transient failures.
 
 ### Transport abstraction
 
@@ -293,12 +316,14 @@ Current behavior includes:
 - Context-manager support.
 - Deterministic cleanup of the underlying `httpx.Client`.
 - Translation of HTTP failures into integration-specific exceptions.
-- Translation of HTTPX timeout errors into transient integration failures.
-- Translation of network and connection errors into transient integration failures.
-- HTTP `401` handling as an authentication failure.
-- HTTP `429` handling as a rate-limit failure.
-- `Retry-After` handling for rate-limited responses.
-- Classification of HTTP `500`, `502`, `503`, and `504` responses as transient integration failures.
+- Translation of HTTPX timeout errors into `UpstreamTimeoutError`.
+- Translation of HTTPX network and connection errors into `UpstreamConnectionError`.
+- HTTP `401` handling as `AuthenticationError`.
+- HTTP `429` handling as `RateLimitError`.
+- HTTP `500` and `502` handling as `UpstreamServerError`.
+- HTTP `503` handling as `UpstreamUnavailableError`.
+- HTTP `504` handling as `UpstreamTimeoutError`.
+- Preservation of `Retry-After` information for rate-limited responses.
 
 This keeps HTTP-specific concerns isolated from higher-level application logic.
 
@@ -343,32 +368,89 @@ Authentication failures returned as HTTP `401` responses are translated into `Au
 
 ### HTTP error translation
 
-The HTTP transport translates low-level HTTP and network failures into the project's integration exception hierarchy.
+The integration layer translates HTTPX and upstream failures into semantic integration exceptions.
 
-Current mappings include:
+Current internal mappings include:
 
 ```text
-401
-  -> AuthenticationError
-429
-  -> RateLimitError
-500 / 502 / 503 / 504
-  -> TransientIntegrationError
 HTTPX timeout
-  -> TransientIntegrationError
+  -> UpstreamTimeoutError
+
 HTTPX network / connection failure
-  -> TransientIntegrationError
+  -> UpstreamConnectionError
+
+401 upstream
+  -> AuthenticationError
+
+429 upstream
+  -> RateLimitError
+
+500 / 502 upstream
+  -> UpstreamServerError
+
+503 upstream
+  -> UpstreamUnavailableError
+
+504 upstream
+  -> UpstreamTimeoutError
 ```
 
-Other non-success HTTP statuses are translated into `IntegrationError`.
+The FastAPI boundary then translates integration exceptions into the public API contract:
 
-This prevents HTTPX-specific failures from leaking into higher-level application code and provides consistent error semantics across integrations.
+```text
+AuthenticationError
+  -> 502 Bad Gateway
+
+RateLimitError
+  -> 503 Service Unavailable
+
+UpstreamConnectionError
+  -> 502 Bad Gateway
+
+UpstreamServerError
+  -> 502 Bad Gateway
+
+UpstreamUnavailableError
+  -> 503 Service Unavailable
+
+UpstreamTimeoutError
+  -> 504 Gateway Timeout
+
+IntegrationError
+  -> 502 Bad Gateway
+```
+
+Upstream status codes are not propagated blindly. The public response reflects the meaning of the failure from the perspective of this API's consumers.
+
+### Public error contract
+
+Integration failures exposed by the API use a stable error response:
+
+```json
+{
+  "code": "upstream_timeout",
+  "detail": "The upstream service did not respond in time."
+}
+```
+
+The public error contract is modeled with Pydantic through `ErrorResponse` and documented in OpenAPI for `502`, `503`, and `504` responses.
+
+Internal exception messages are not returned directly to API consumers, reducing accidental information leakage.
 
 ### Rate-limit handling
 
-HTTP `429 Too Many Requests` responses are recognized as rate-limit failures.
+HTTP `429 Too Many Requests` responses from the upstream provider are translated into `RateLimitError`.
 
-When the remote service provides a `Retry-After` header, the transport preserves the relevant rate-limit information through the integration error boundary so retry behavior can make informed decisions.
+When an upstream rate limit provides `Retry-After`, the API validates the value before exposing it to consumers.
+
+Supported HTTP formats are:
+
+- Non-negative delay seconds.
+- Valid HTTP dates.
+
+Invalid values are omitted rather than corrected or propagated blindly.
+
+An upstream rate limit is exposed as `503 Service Unavailable`, because the limit belongs to the service-to-provider interaction rather than necessarily representing a rate limit imposed on the API consumer.
 
 More advanced retry scheduling, exponential backoff, and jitter remain part of a later resilience phase.
 
@@ -464,11 +546,14 @@ The current test suite covers:
 - HTTPX `MockTransport`-based integration tests.
 - Authentication error translation for HTTP `401`.
 - Rate-limit error translation for HTTP `429`.
-- `Retry-After` handling.
-- Transient error classification for HTTP `500`.
-- Transient error classification for HTTP `502`.
-- Transient error classification for HTTP `503`.
-- Transient error classification for HTTP `504`.
+- Semantic upstream failure classification.
+- Public API exception-handler mappings.
+- Public error-response contract.
+- Prevention of internal error-message leakage.
+- Valid `Retry-After` delay-seconds propagation.
+- Valid `Retry-After` HTTP-date propagation.
+- Invalid `Retry-After` rejection.
+- OpenAPI documentation for `502`, `503`, and `504` responses.
 - Permanent HTTP error translation.
 - Timeout error translation.
 - Network and connection error translation.
@@ -494,7 +579,7 @@ The current test suite covers:
 Current test count:
 
 ```text
-53 tests
+68 tests
 ```
 
 Run the suite with:
@@ -698,6 +783,8 @@ The project follows several principles that will guide future changes:
 - Keep HTTP-specific behavior behind transport abstractions.
 - Keep Pydantic-specific types at the configuration boundary.
 - Translate external-library failures into domain-specific integration errors.
+- Do not propagate upstream HTTP status codes blindly across API boundaries.
+- Keep internal diagnostic messages separate from public error messages.
 - Retry only failures that are actually retryable.
 - Never silently swallow exceptions.
 - Preserve original exceptions and tracebacks when possible.
@@ -705,10 +792,12 @@ The project follows several principles that will guide future changes:
 - Never log access tokens or other secrets.
 - Validate configuration early.
 - Make secret extraction explicit and localized.
+- Validate externally supplied response metadata before exposing it downstream.
 - Prefer lazy processing when large datasets do not need to be fully loaded into memory.
 - Use context managers for deterministic cleanup of managed resources.
 - Make resource ownership and lifecycle explicit.
 - Write tests around observable behavior rather than implementation details.
+- Test both runtime behavior and published OpenAPI contracts when they are part of the API surface.
 - Patch dependencies where they are looked up by the code under test.
 - Use HTTPX `MockTransport` to test HTTP behavior without real network calls.
 - Use pytest fixtures and `monkeypatch` to isolate test state.
@@ -759,6 +848,11 @@ The project will evolve incrementally.
 - [x] FastAPI dependency injection.
 - [x] Vendor router behavior.
 - [x] Dependency overrides for isolated API tests.
+- [x] Semantic upstream exception classification.
+- [x] FastAPI integration error translation.
+- [x] Public API error-response contract.
+- [x] Safe `Retry-After` propagation.
+- [x] OpenAPI integration-error documentation.
 - [x] GitHub Actions continuous integration.
 - [x] Automated Ruff format verification.
 - [x] Automated Ruff lint checks.
@@ -788,6 +882,6 @@ This repository is under active development and is intentionally built in small,
 
 Each phase adds a focused backend concept together with tests before moving to the next topic.
 
-The current implementation includes validated application configuration with Pydantic Settings, explicit secret handling with `SecretStr`, a composition root that wires and owns integration resources, a focused `VendorClient`, a concrete HTTPX transport with authentication and deterministic cleanup, HTTP error translation, timeout and network failure handling, rate-limit awareness, FastAPI lifespan-managed initialization and cleanup, typed application state, dependency injection, the `GET /vendor/items` router flow, isolated API tests through dependency overrides, and a GitHub Actions CI pipeline that verifies formatting, linting, tests, coverage, and test reports.
+The current implementation includes validated application configuration with Pydantic Settings, explicit secret handling with `SecretStr`, a composition root that wires and owns integration resources, a focused `VendorClient`, a concrete HTTPX transport with authentication and deterministic cleanup, semantic upstream exception classification, FastAPI integration error translation, a stable public error-response contract, safe `Retry-After` propagation, OpenAPI documentation for integration failures, FastAPI lifespan-managed initialization and cleanup, typed application state, dependency injection, the `GET /vendor/items` router flow, isolated API tests through dependency overrides, and a GitHub Actions CI pipeline that verifies formatting, linting, tests, coverage, and test reports.
 
-The current suite contains 53 passing tests.
+The current suite contains 68 passing tests.

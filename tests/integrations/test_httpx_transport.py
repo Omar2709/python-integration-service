@@ -5,7 +5,10 @@ from python_integration_service.integrations.exceptions import (
     AuthenticationError,
     IntegrationError,
     RateLimitError,
-    TransientIntegrationError,
+    UpstreamConnectionError,
+    UpstreamServerError,
+    UpstreamTimeoutError,
+    UpstreamUnavailableError,
 )
 from python_integration_service.integrations.httpx_transport import HttpxTransport
 
@@ -54,7 +57,10 @@ def test_401_raises_authentication_error_with_http_status_cause() -> None:
     ):
         transport.get("https://api.vendor.test/customers/123")
 
-    assert isinstance(exc_info.value.__cause__, httpx.HTTPStatusError)
+    assert isinstance(
+        exc_info.value.__cause__,
+        httpx.HTTPStatusError,
+    )
 
 
 def test_429_preserves_retry_after_header() -> None:
@@ -78,7 +84,7 @@ def test_429_preserves_retry_after_header() -> None:
     assert exc_info.value.retry_after == "30"
 
 
-def test_timeout_raises_transient_integration_error_with_timeout_cause() -> None:
+def test_timeout_raises_upstream_timeout_error_with_timeout_cause() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout(
             "Read operation timed out",
@@ -91,14 +97,17 @@ def test_timeout_raises_transient_integration_error_with_timeout_cause() -> None
             timeout=10.0,
             transport=httpx.MockTransport(handler),
         ) as transport,
-        pytest.raises(TransientIntegrationError) as exc_info,
+        pytest.raises(UpstreamTimeoutError) as exc_info,
     ):
         transport.get("https://api.vendor.test/customers/123")
 
-    assert isinstance(exc_info.value.__cause__, httpx.ReadTimeout)
+    assert isinstance(
+        exc_info.value.__cause__,
+        httpx.ReadTimeout,
+    )
 
 
-def test_connect_error_raises_transient_integration_error_with_connect_cause() -> None:
+def test_connect_error_raises_upstream_connection_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError(
             "Could not connect",
@@ -111,14 +120,17 @@ def test_connect_error_raises_transient_integration_error_with_connect_cause() -
             timeout=10.0,
             transport=httpx.MockTransport(handler),
         ) as transport,
-        pytest.raises(TransientIntegrationError) as exc_info,
+        pytest.raises(UpstreamConnectionError) as exc_info,
     ):
         transport.get("https://api.vendor.test/customers/123")
 
-    assert isinstance(exc_info.value.__cause__, httpx.ConnectError)
+    assert isinstance(
+        exc_info.value.__cause__,
+        httpx.ConnectError,
+    )
 
 
-def test_read_error_raises_transient_integration_error_with_read_cause() -> None:
+def test_read_error_raises_upstream_connection_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadError(
             "Connection interrupted while reading response",
@@ -131,21 +143,24 @@ def test_read_error_raises_transient_integration_error_with_read_cause() -> None
             timeout=10.0,
             transport=httpx.MockTransport(handler),
         ) as transport,
-        pytest.raises(TransientIntegrationError) as exc_info,
+        pytest.raises(UpstreamConnectionError) as exc_info,
     ):
         transport.get("https://api.vendor.test/customers/123")
 
-    assert isinstance(exc_info.value.__cause__, httpx.ReadError)
+    assert isinstance(
+        exc_info.value.__cause__,
+        httpx.ReadError,
+    )
 
 
-@pytest.mark.parametrize("status_code", [500, 502, 503, 504])
-def test_transient_http_statuses_raise_transient_integration_error(
+@pytest.mark.parametrize("status_code", [500, 502])
+def test_upstream_server_failures_raise_upstream_server_error(
     status_code: int,
 ) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             status_code,
-            json={"detail": "temporary upstream failure"},
+            json={"detail": "upstream server failure"},
         )
 
     with (
@@ -154,7 +169,53 @@ def test_transient_http_statuses_raise_transient_integration_error(
             timeout=10.0,
             transport=httpx.MockTransport(handler),
         ) as transport,
-        pytest.raises(TransientIntegrationError) as exc_info,
+        pytest.raises(UpstreamServerError) as exc_info,
+    ):
+        transport.get("https://api.vendor.test/customers/123")
+
+    assert isinstance(
+        exc_info.value.__cause__,
+        httpx.HTTPStatusError,
+    )
+
+
+def test_503_raises_upstream_unavailable_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            503,
+            json={"detail": "service unavailable"},
+        )
+
+    with (
+        HttpxTransport(
+            access_token="test-token",
+            timeout=10.0,
+            transport=httpx.MockTransport(handler),
+        ) as transport,
+        pytest.raises(UpstreamUnavailableError) as exc_info,
+    ):
+        transport.get("https://api.vendor.test/customers/123")
+
+    assert isinstance(
+        exc_info.value.__cause__,
+        httpx.HTTPStatusError,
+    )
+
+
+def test_504_raises_upstream_timeout_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            504,
+            json={"detail": "gateway timeout"},
+        )
+
+    with (
+        HttpxTransport(
+            access_token="test-token",
+            timeout=10.0,
+            transport=httpx.MockTransport(handler),
+        ) as transport,
+        pytest.raises(UpstreamTimeoutError) as exc_info,
     ):
         transport.get("https://api.vendor.test/customers/123")
 

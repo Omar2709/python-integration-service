@@ -7,7 +7,10 @@ from python_integration_service.integrations.exceptions import (
     AuthenticationError,
     IntegrationError,
     RateLimitError,
-    TransientIntegrationError,
+    UpstreamConnectionError,
+    UpstreamServerError,
+    UpstreamTimeoutError,
+    UpstreamUnavailableError,
 )
 from python_integration_service.integrations.transport import Transport
 
@@ -49,12 +52,12 @@ class HttpxTransport(Transport):
             response.raise_for_status()
 
         except httpx.TimeoutException as exc:
-            raise TransientIntegrationError(
+            raise UpstreamTimeoutError(
                 f"Request timed out while calling {url}"
             ) from exc
 
         except httpx.NetworkError as exc:
-            raise TransientIntegrationError(
+            raise UpstreamConnectionError(
                 f"Network error while calling external service: {url}"
             ) from exc
 
@@ -74,9 +77,19 @@ class HttpxTransport(Transport):
                     retry_after=retry_after,
                 ) from exc
 
-            if status_code in (500, 502, 503, 504):
-                raise TransientIntegrationError(
-                    f"External service returned transient HTTP {status_code}"
+            if status_code in (500, 502):
+                raise UpstreamServerError(
+                    f"External service returned HTTP {status_code}"
+                ) from exc
+
+            if status_code == 503:
+                raise UpstreamUnavailableError(
+                    "External service is temporarily unavailable"
+                ) from exc
+
+            if status_code == 504:
+                raise UpstreamTimeoutError(
+                    "External service reported a gateway timeout"
                 ) from exc
 
             raise IntegrationError(

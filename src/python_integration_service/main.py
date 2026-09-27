@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from python_integration_service.api.errors import register_exception_handlers
 from python_integration_service.api.vendor import router as vendor_router
 from python_integration_service.composition import create_vendor_client
 from python_integration_service.config import load_settings
@@ -22,6 +23,8 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+register_exception_handlers(app)
 
 app.include_router(vendor_router)
 

@@ -10,7 +10,11 @@ class AuthenticationError(IntegrationError):
     """Raised when authentication with the provider fails."""
 
 
-class RateLimitError(IntegrationError):
+class TransientIntegrationError(IntegrationError):
+    """Base exception for temporary integration failures."""
+
+
+class RateLimitError(TransientIntegrationError):
     """Raised when the provider rate limit is exceeded."""
 
     def __init__(
@@ -22,5 +26,17 @@ class RateLimitError(IntegrationError):
         self.retry_after = retry_after
 
 
-class TransientIntegrationError(IntegrationError):
-    """Raised for temporary integration failures."""
+class UpstreamTimeoutError(TransientIntegrationError):
+    """Raised when an upstream operation times out."""
+
+
+class UpstreamConnectionError(TransientIntegrationError):
+    """Raised when the upstream service cannot be reached reliably."""
+
+
+class UpstreamServerError(TransientIntegrationError):
+    """Raised when the upstream service reports an internal server failure."""
+
+
+class UpstreamUnavailableError(TransientIntegrationError):
+    """Raised when the upstream service is temporarily unavailable."""
