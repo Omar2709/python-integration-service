@@ -103,6 +103,7 @@ python-integration-service/
 ├── .env.example
 ├── .gitignore
 ├── .python-version
+├── LICENSE
 ├── pyproject.toml
 ├── uv.lock
 └── README.md
@@ -579,7 +580,7 @@ The current test suite covers:
 Current test count:
 
 ```text
-68 tests
+69 tests
 ```
 
 Run the suite with:
@@ -884,4 +885,4 @@ Each phase adds a focused backend concept together with tests before moving to t
 
 The current implementation includes validated application configuration with Pydantic Settings, explicit secret handling with `SecretStr`, a composition root that wires and owns integration resources, a focused `VendorClient`, a concrete HTTPX transport with authentication and deterministic cleanup, semantic upstream exception classification, FastAPI integration error translation, a stable public error-response contract, safe `Retry-After` propagation, OpenAPI documentation for integration failures, FastAPI lifespan-managed initialization and cleanup, typed application state, dependency injection, the `GET /vendor/items` router flow, isolated API tests through dependency overrides, and a GitHub Actions CI pipeline that verifies formatting, linting, tests, coverage, and test reports.
 
-The current suite contains 68 passing tests.
+The current suite contains 69 passing tests.

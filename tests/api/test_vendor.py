@@ -188,6 +188,7 @@ def test_rate_limit_error_preserves_valid_retry_after_http_date(
         "   ",
         "-10",
         "bananas",
+        "Fri, 31 Dec 1999 23:59:59",
     ],
 )
 def test_rate_limit_error_omits_invalid_retry_after(
