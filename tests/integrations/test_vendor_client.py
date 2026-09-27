@@ -10,7 +10,12 @@ from python_integration_service.integrations.exceptions import (
 from python_integration_service.integrations.retry import RetryPolicy
 from python_integration_service.integrations.transport import Transport
 from python_integration_service.integrations.vendor_client import VendorClient
-from python_integration_service.integrations.vendor_schemas import VendorItem
+from python_integration_service.integrations.vendor_schemas import (
+    VendorCategory,
+    VendorItem,
+    VendorItemAttributes,
+    VendorStatus,
+)
 
 
 def make_retry_policy() -> MagicMock:
@@ -90,7 +95,11 @@ def test_invalid_upstream_payload_is_not_retried() -> None:
         "items": [
             {
                 "id": "not-an-integer",
-                "name": "Broken item",
+                "attributes": {
+                    "display_name": "Broken item",
+                    "category": "hardware",
+                },
+                "status": "enabled",
             }
         ],
         "next_page": None,
@@ -128,7 +137,11 @@ def test_get_items_page_validates_vendor_response() -> None:
         "items": [
             {
                 "id": 1,
-                "name": "Item 1",
+                "attributes": {
+                    "display_name": "Item 1",
+                    "category": "hardware",
+                },
+                "status": "enabled",
                 "created_at": "2026-09-26T12:00:00Z",
             }
         ],
@@ -147,7 +160,11 @@ def test_get_items_page_validates_vendor_response() -> None:
     assert page.items == [
         VendorItem(
             id=1,
-            name="Item 1",
+            attributes=VendorItemAttributes(
+                display_name="Item 1",
+                category=VendorCategory.HARDWARE,
+            ),
+            status=VendorStatus.ENABLED,
         )
     ]
     assert page.next_page == 2
@@ -162,7 +179,11 @@ def test_get_items_page_validates_vendor_response() -> None:
             "items": [
                 {
                     "id": "1",
-                    "name": "Item 1",
+                    "attributes": {
+                        "display_name": "Item 1",
+                        "category": "hardware",
+                    },
+                    "status": "enabled",
                 }
             ],
             "next_page": None,
@@ -171,7 +192,11 @@ def test_get_items_page_validates_vendor_response() -> None:
             "items": [
                 {
                     "id": 1,
-                    "name": "Item 1",
+                    "attributes": {
+                        "display_name": "Item 1",
+                        "category": "hardware",
+                    },
+                    "status": "enabled",
                 }
             ],
             "next_page": "2",
@@ -183,6 +208,55 @@ def test_get_items_page_rejects_invalid_field_types(
 ) -> None:
     transport = MagicMock(spec=Transport)
     transport.get.return_value = payload
+
+    client = VendorClient(
+        base_url="https://api.vendor.test",
+        transport=transport,
+        retry_policy=make_retry_policy(),
+    )
+
+    with pytest.raises(InvalidUpstreamResponseError) as exc_info:
+        client.get_items_page(page=1)
+
+    assert isinstance(
+        exc_info.value.__cause__,
+        ValidationError,
+    )
+
+
+@pytest.mark.parametrize(
+    "item_payload",
+    [
+        {
+            "id": 1,
+            "attributes": {
+                "display_name": "Item 1",
+                "category": "hardware",
+            },
+            "status": "archived",
+        },
+        {
+            "id": 1,
+            "attributes": {
+                "display_name": "Item 1",
+                "category": "unknown",
+            },
+            "status": "enabled",
+        },
+        {
+            "id": 1,
+            "status": "enabled",
+        },
+    ],
+)
+def test_get_items_page_rejects_invalid_upstream_item_contract(
+    item_payload: dict,
+) -> None:
+    transport = MagicMock(spec=Transport)
+    transport.get.return_value = {
+        "items": [item_payload],
+        "next_page": None,
+    }
 
     client = VendorClient(
         base_url="https://api.vendor.test",
@@ -294,7 +368,11 @@ def test_iter_items_fetches_pages_lazily() -> None:
             "items": [
                 {
                     "id": 1,
-                    "name": "Item 1",
+                    "attributes": {
+                        "display_name": "Item 1",
+                        "category": "hardware",
+                    },
+                    "status": "enabled",
                 }
             ],
             "next_page": 2,
@@ -303,7 +381,11 @@ def test_iter_items_fetches_pages_lazily() -> None:
             "items": [
                 {
                     "id": 2,
-                    "name": "Item 2",
+                    "attributes": {
+                        "display_name": "Item 2",
+                        "category": "software",
+                    },
+                    "status": "disabled",
                 }
             ],
             "next_page": None,
@@ -322,7 +404,11 @@ def test_iter_items_fetches_pages_lazily() -> None:
 
     assert first_item == VendorItem(
         id=1,
-        name="Item 1",
+        attributes=VendorItemAttributes(
+            display_name="Item 1",
+            category=VendorCategory.HARDWARE,
+        ),
+        status=VendorStatus.ENABLED,
     )
 
     transport.get.assert_called_once_with("https://api.vendor.test/items?page=1")
@@ -331,7 +417,11 @@ def test_iter_items_fetches_pages_lazily() -> None:
 
     assert second_item == VendorItem(
         id=2,
-        name="Item 2",
+        attributes=VendorItemAttributes(
+            display_name="Item 2",
+            category=VendorCategory.SOFTWARE,
+        ),
+        status=VendorStatus.DISABLED,
     )
 
     assert transport.get.call_args_list == [
@@ -350,7 +440,11 @@ def test_iter_items_rejects_cyclic_pagination() -> None:
             "items": [
                 {
                     "id": 1,
-                    "name": "Item 1",
+                    "attributes": {
+                        "display_name": "Item 1",
+                        "category": "hardware",
+                    },
+                    "status": "enabled",
                 }
             ],
             "next_page": 2,
@@ -359,7 +453,11 @@ def test_iter_items_rejects_cyclic_pagination() -> None:
             "items": [
                 {
                     "id": 2,
-                    "name": "Item 2",
+                    "attributes": {
+                        "display_name": "Item 2",
+                        "category": "hardware",
+                    },
+                    "status": "enabled",
                 }
             ],
             "next_page": 1,
@@ -376,7 +474,11 @@ def test_iter_items_rejects_cyclic_pagination() -> None:
 
     assert next(items) == VendorItem(
         id=1,
-        name="Item 1",
+        attributes=VendorItemAttributes(
+            display_name="Item 1",
+            category=VendorCategory.HARDWARE,
+        ),
+        status=VendorStatus.ENABLED,
     )
 
     with pytest.raises(InvalidUpstreamResponseError):
@@ -399,7 +501,11 @@ def test_iter_items_skips_empty_pages_and_continues() -> None:
             "items": [
                 {
                     "id": 2,
-                    "name": "Item 2",
+                    "attributes": {
+                        "display_name": "Item 2",
+                        "category": "accessory",
+                    },
+                    "status": "enabled",
                 }
             ],
             "next_page": None,
@@ -417,7 +523,11 @@ def test_iter_items_skips_empty_pages_and_continues() -> None:
     assert items == [
         VendorItem(
             id=2,
-            name="Item 2",
+            attributes=VendorItemAttributes(
+                display_name="Item 2",
+                category=VendorCategory.ACCESSORY,
+            ),
+            status=VendorStatus.ENABLED,
         )
     ]
 
@@ -454,7 +564,11 @@ def test_iter_items_allows_non_monotonic_unvisited_pages() -> None:
             "items": [
                 {
                     "id": 1,
-                    "name": "Item 1",
+                    "attributes": {
+                        "display_name": "Item 1",
+                        "category": "hardware",
+                    },
+                    "status": "enabled",
                 }
             ],
             "next_page": 3,
@@ -463,7 +577,11 @@ def test_iter_items_allows_non_monotonic_unvisited_pages() -> None:
             "items": [
                 {
                     "id": 2,
-                    "name": "Item 2",
+                    "attributes": {
+                        "display_name": "Item 2",
+                        "category": "software",
+                    },
+                    "status": "enabled",
                 }
             ],
             "next_page": 2,
@@ -472,7 +590,11 @@ def test_iter_items_allows_non_monotonic_unvisited_pages() -> None:
             "items": [
                 {
                     "id": 3,
-                    "name": "Item 3",
+                    "attributes": {
+                        "display_name": "Item 3",
+                        "category": "accessory",
+                    },
+                    "status": "disabled",
                 }
             ],
             "next_page": None,
@@ -490,15 +612,27 @@ def test_iter_items_allows_non_monotonic_unvisited_pages() -> None:
     assert items == [
         VendorItem(
             id=1,
-            name="Item 1",
+            attributes=VendorItemAttributes(
+                display_name="Item 1",
+                category=VendorCategory.HARDWARE,
+            ),
+            status=VendorStatus.ENABLED,
         ),
         VendorItem(
             id=2,
-            name="Item 2",
+            attributes=VendorItemAttributes(
+                display_name="Item 2",
+                category=VendorCategory.SOFTWARE,
+            ),
+            status=VendorStatus.ENABLED,
         ),
         VendorItem(
             id=3,
-            name="Item 3",
+            attributes=VendorItemAttributes(
+                display_name="Item 3",
+                category=VendorCategory.ACCESSORY,
+            ),
+            status=VendorStatus.DISABLED,
         ),
     ]
 

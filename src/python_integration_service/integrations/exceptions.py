@@ -14,6 +14,18 @@ class InvalidUpstreamResponseError(IntegrationError):
     """Raised when the upstream service returns an invalid response payload."""
 
 
+class InvalidVendorDataError(InvalidUpstreamResponseError):
+    """Raised when structurally valid vendor data violates application semantics."""
+
+
+class MappingError(IntegrationError):
+    """Base exception for failures adapting upstream data."""
+
+
+class UnsupportedVendorCategoryError(MappingError):
+    """Raised when a vendor category cannot be mapped to the public contract."""
+
+
 class TransientIntegrationError(IntegrationError):
     """Base exception for temporary integration failures."""
 

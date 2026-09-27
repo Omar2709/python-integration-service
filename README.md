@@ -73,22 +73,31 @@ python-integration-service/
 │       │   ├── errors.py
 │       │   ├── schemas.py
 │       │   └── vendor.py
+│       ├── integrations/
+│       │   ├── __init__.py
+│       │   ├── exceptions.py
+│       │   ├── httpx_transport.py
+│       │   ├── managed_resource.py
+│       │   ├── page_iterator.py
+│       │   ├── pagination.py
+│       │   ├── resource_context.py
+│       │   ├── retry.py
+│       │   ├── transport.py
+│       │   ├── vendor_client.py
+│       │   └── vendor_schemas.py
+│       ├── mappers/
+│       │   ├── __init__.py
+│       │   └── vendor.py
+│       ├── transformers/
+│       │   ├── __init__.py
+│       │   └── vendor.py
+│       ├── validators/
+│       │   ├── __init__.py
+│       │   └── vendor.py
 │       ├── composition.py
 │       ├── config.py
 │       ├── dependencies.py
-│       ├── main.py
-│       └── integrations/
-│           ├── __init__.py
-│           ├── exceptions.py
-│           ├── httpx_transport.py
-│           ├── managed_resource.py
-│           ├── page_iterator.py
-│           ├── pagination.py
-│           ├── resource_context.py
-│           ├── retry.py
-│           ├── transport.py
-│           ├── vendor_client.py
-│           └── vendor_schemas.py
+│       └── main.py
 ├── tests/
 │   ├── api/
 │   │   └── test_vendor.py
@@ -100,6 +109,12 @@ python-integration-service/
 │   │   ├── test_resource_context.py
 │   │   ├── test_retry.py
 │   │   └── test_vendor_client.py
+│   ├── mappers/
+│   │   └── test_vendor_mapper.py
+│   ├── transformers/
+│   │   └── test_vendor_transformer.py
+│   ├── validators/
+│   │   └── test_vendor_validator.py
 │   ├── test_composition.py
 │   ├── test_config.py
 │   ├── test_dependencies.py
@@ -184,6 +199,9 @@ Current exception types include:
 - `ConfigurationError`
 - `AuthenticationError`
 - `InvalidUpstreamResponseError`
+- `InvalidVendorDataError`
+- `MappingError`
+- `UnsupportedVendorCategoryError`
 - `TransientIntegrationError`
 - `RateLimitError`
 - `UpstreamTimeoutError`
@@ -191,14 +209,21 @@ Current exception types include:
 - `UpstreamServerError`
 - `UpstreamUnavailableError`
 
-Transient integration failures share a common base while preserving semantic subtypes:
+The hierarchy separates invalid upstream data, adaptation failures, and transient operational failures:
 
 ```text
 IntegrationError
 |
 +-- ConfigurationError
 +-- AuthenticationError
+|
 +-- InvalidUpstreamResponseError
+|   |
+|   +-- InvalidVendorDataError
+|
++-- MappingError
+|   |
+|   +-- UnsupportedVendorCategoryError
 |
 +-- TransientIntegrationError
     |
@@ -211,9 +236,15 @@ IntegrationError
 
 `InvalidUpstreamResponseError` represents a provider response that was successfully received at the transport level but does not satisfy the integration contract.
 
-It intentionally does not inherit from `TransientIntegrationError`, because an invalid provider payload is not assumed to become valid through an immediate retry.
+`InvalidVendorDataError` represents structurally valid upstream data that violates application-specific semantic invariants, such as a `display_name` that becomes blank after trimming.
 
-This allows higher-level application code to distinguish integration-specific failures from unrelated programming errors while still applying common resilience policies to transient failures.
+`MappingError` represents a different category: valid upstream data that cannot currently be adapted to the public API contract.
+
+`UnsupportedVendorCategoryError` is used when the provider returns a valid category for which the public API has no explicit mapping.
+
+These failures intentionally do not inherit from `TransientIntegrationError`, because immediate retries are not expected to correct invalid data or unsupported contract adaptation.
+
+This allows higher-level application code to distinguish integration-specific failures while applying resilience policies only to genuinely transient failures.
 
 ### Transport abstraction
 
@@ -534,6 +565,182 @@ This allows the provider contract and the public API contract to evolve independ
 
 For example, a future provider field rename could be handled inside the explicit adaptation layer without necessarily changing the public API contract.
 
+### Data transformation and validation
+
+Vendor payloads pass through explicit validation and transformation stages before reaching the public API contract:
+
+```text
+raw upstream JSON
+        ↓
+upstream schema validation
+        ↓
+semantic validation
+        ↓
+mapping
+        ↓
+public response model
+```
+
+Each stage has a distinct responsibility:
+
+- Upstream Pydantic models validate the structure and documented provider contract.
+- Semantic validators enforce application-specific invariants that are not necessarily part of the upstream schema.
+- Mappers perform deterministic adaptation between upstream and public contracts.
+- Transformers coordinate validation and mapping without moving those responsibilities into the API route.
+- Public response models define the stable contract exposed to API consumers.
+
+The provider payload is modeled explicitly with nested attributes:
+
+```text
+VendorItem
+├── id
+├── attributes
+│   ├── display_name
+│   └── category
+└── status
+```
+
+The public representation intentionally differs:
+
+```text
+ItemResponse
+├── id
+├── name
+├── category
+└── active
+```
+
+This keeps the upstream contract separate from the public API contract.
+
+#### Separate upstream and public enums
+
+Upstream and public categories use independent enum types:
+
+```text
+VendorCategory
+        ↓
+explicit mapping
+        ↓
+ItemCategory
+```
+
+Even when both enums contain matching values, they represent different contracts and are not reused across layers.
+
+For example, the provider can support:
+
+```text
+VendorCategory.BUNDLE
+```
+
+while the public API still exposes only:
+
+```text
+hardware
+software
+accessory
+```
+
+A provider-contract change therefore does not automatically modify the public API contract.
+
+Unsupported mappings fail explicitly rather than being silently converted to another category.
+
+#### Semantic validation
+
+A payload can be structurally valid while still violating application semantics.
+
+For example:
+
+```text
+display_name = "   "
+```
+
+is structurally a string, but it cannot produce a valid public item name after trimming.
+
+This condition raises:
+
+```text
+InvalidVendorDataError
+```
+
+Semantic validation remains separate from Pydantic schema validation so the application can distinguish:
+
+```text
+structurally invalid upstream data
+        ↓
+InvalidUpstreamResponseError
+```
+
+from:
+
+```text
+structurally valid but semantically invalid data
+        ↓
+InvalidVendorDataError
+```
+
+#### Fail-fast page semantics
+
+Paginated transformations use fail-fast page semantics.
+
+A page is returned only if every item can be validated and transformed successfully.
+
+```text
+page
+├── valid item
+├── invalid item
+└── valid item
+        ↓
+entire page fails
+```
+
+The service does not silently remove invalid items because a consumer could otherwise interpret a partial page as a complete result.
+
+Page transformation therefore follows:
+
+```text
+validate entire page
+        ↓
+all items valid
+        ↓
+map entire page
+```
+
+#### Mapping failures
+
+A valid upstream value is not necessarily representable by the public API.
+
+For example, `VendorCategory.BUNDLE` can be valid according to the provider contract while the public API still has no `ItemCategory.BUNDLE`.
+
+This is treated as an adaptation failure rather than invalid upstream data:
+
+```text
+valid upstream value
+        ↓
+no public mapping exists
+        ↓
+UnsupportedVendorCategoryError
+        ↓
+MappingError
+```
+
+Implementation details such as `KeyError` are not exposed across the integration boundary. They are translated into semantic mapping exceptions while preserving the original exception as the internal cause for diagnostics.
+
+#### Normalization policy
+
+Mapping performs only deterministic normalization required by the public contract.
+
+For example:
+
+```text
+"  Keyboard  "
+        ↓
+"Keyboard"
+```
+
+The service intentionally avoids aggressive data cleansing such as automatic title casing, collapsing internal whitespace, case conversion, or arbitrary Unicode normalization unless such behavior becomes an explicit contract requirement.
+
+This avoids inventing semantics or modifying valid provider information unnecessarily.
+
 ### Authentication
 
 Outbound vendor requests support Bearer token authentication.
@@ -552,7 +759,7 @@ Authentication failures returned as HTTP `401` responses are translated into `Au
 
 ### HTTP error translation
 
-The integration layer translates HTTPX and upstream failures into semantic integration exceptions.
+The integration layer translates HTTPX, upstream, semantic-validation, and mapping failures into semantic integration exceptions.
 
 Current internal mappings include:
 
@@ -580,6 +787,13 @@ HTTPX network / connection failure
 
 Invalid upstream payload
   -> InvalidUpstreamResponseError
+
+Structurally valid but semantically invalid vendor data
+  -> InvalidVendorDataError
+
+Valid upstream value without a supported public mapping
+  -> UnsupportedVendorCategoryError
+  -> MappingError
 ```
 
 The FastAPI boundary then translates integration exceptions into the public API contract:
@@ -592,6 +806,14 @@ AuthenticationError
 InvalidUpstreamResponseError
   -> 502 Bad Gateway
   -> upstream_invalid_response
+
+InvalidVendorDataError
+  -> 502 Bad Gateway
+  -> upstream_invalid_response
+
+MappingError
+  -> 502 Bad Gateway
+  -> upstream_mapping_error
 
 RateLimitError
   -> 503 Service Unavailable
@@ -620,11 +842,13 @@ IntegrationError
 
 Upstream status codes are not propagated blindly. The public response reflects the meaning of the failure from the perspective of this API's consumers.
 
-A provider response can also fail even when its HTTP status is successful. For example, an HTTP `200` response containing an invalid pagination payload is translated into `InvalidUpstreamResponseError`.
+A provider response can fail even when its HTTP status is successful. An HTTP `200` response may contain a structurally invalid payload, semantically unusable vendor data, or valid upstream data that cannot yet be represented by the public contract.
 
 ### Public error contract
 
-Integration failures exposed by the API use a stable error response:
+Integration failures exposed by the API use stable public error responses.
+
+For example, an upstream timeout is exposed as:
 
 ```json
 {
@@ -633,7 +857,7 @@ Integration failures exposed by the API use a stable error response:
 }
 ```
 
-Invalid provider responses use:
+Invalid provider responses and semantically invalid vendor data use:
 
 ```json
 {
@@ -642,11 +866,20 @@ Invalid provider responses use:
 }
 ```
 
+Mapping failures use:
+
+```json
+{
+  "code": "upstream_mapping_error",
+  "detail": "The upstream data could not be adapted to the public API contract."
+}
+```
+
 The public error contract is modeled with Pydantic through `ErrorResponse` and documented in OpenAPI for `502`, `503`, and `504` responses.
 
-Internal exception messages and Pydantic validation details are not returned directly to API consumers, reducing accidental information leakage.
+Internal exception messages, Pydantic validation details, unsupported enum members, dictionary lookup failures, and other implementation details are not returned directly to API consumers.
 
-The public error code communicates a stable failure category while implementation-specific validation details remain inside the integration boundary.
+The public error code communicates a stable failure category while implementation-specific diagnostic details remain inside the integration boundary.
 
 FastAPI request-validation errors remain separate from the integration-error contract.
 
@@ -1027,11 +1260,27 @@ The suite also covers:
 - Invalid public page query validation.
 - OpenAPI documentation for the paginated success response.
 - Public `upstream_invalid_response` error translation.
+- Nested upstream item validation.
+- Closed upstream status and category enums.
+- Rejection of unknown upstream enum values.
+- Semantic vendor-item validation.
+- Whitespace-only display-name rejection.
+- Whole-page semantic validation.
+- Fail-fast page transformation.
+- Explicit item mapping.
+- Explicit page mapping.
+- Separate upstream and public category enums.
+- Unsupported vendor-category detection.
+- Mapping-error exception translation.
+- Prevention of mapping implementation-error leakage.
+- Public `upstream_mapping_error` translation.
+- End-to-end unsupported-category API behavior.
+- Deterministic display-name normalization.
 
 Current test count:
 
 ```text
-106 tests
+125 tests
 ```
 
 Run the suite with:
@@ -1286,6 +1535,12 @@ The project follows several principles that will guide future changes:
 - Keep Pydantic-specific types at the configuration boundary.
 - Use dedicated schemas to validate upstream provider contracts.
 - Keep upstream provider schemas separate from public API response schemas.
+- Keep upstream and public enums separate even when they currently share values.
+- Use explicit mapping between independent contracts instead of relying on matching strings.
+- Keep semantic validation separate from structural schema validation.
+- Validate complete pages before mapping when the public contract requires fail-fast page consistency.
+- Keep mappers deterministic and limited to contract-required normalization.
+- Translate mapping implementation failures into semantic integration errors.
 - Translate external-library failures into domain-specific integration errors.
 - Translate invalid upstream payloads into semantic integration errors.
 - Do not propagate upstream HTTP status codes blindly across API boundaries.
@@ -1396,10 +1651,19 @@ The project will evolve incrementally.
 - [x] Public page-query validation.
 - [x] Separate upstream and public pagination models.
 - [x] OpenAPI paginated-success documentation.
+- [x] Data transformation and validation.
+- [x] Nested upstream payload models.
+- [x] Separate upstream and public enums.
+- [x] Explicit item and page mapping.
+- [x] Semantic vendor-data validation.
+- [x] Fail-fast page validation.
+- [x] Mapping-error hierarchy.
+- [x] Unsupported-contract mapping detection.
+- [x] Stable public mapping-error responses.
+- [x] Deterministic contract normalization.
 
 ### Next
 
-- [ ] Data transformation and validation.
 - [ ] Advanced pytest fixtures and mocks.
 - [ ] Client-side rate limiting.
 - [ ] Retry budget / retry deadline.
@@ -1419,8 +1683,8 @@ This repository is under active development and is intentionally built in small,
 
 Each phase adds a focused backend concept together with tests before moving to the next topic.
 
-The current implementation includes validated application configuration with Pydantic Settings, explicit secret handling with `SecretStr`, retry configuration through environment-backed settings, a composition root that wires and owns integration resources, composition-root injection of a configurable resilience policy, a concrete HTTPX transport with Bearer authentication and deterministic cleanup, semantic upstream exception classification, configurable transient-failure retries, exponential backoff with full jitter, normalized `Retry-After` handling, `Retry-After`-aware scheduling, bounded provider-directed retry waits, strict upstream pagination schemas, lazy vendor pagination, empty-page handling, cycle detection, non-monotonic pagination support, invalid upstream-response translation, separate upstream and public response models, a paginated `GET /vendor/items?page=N` API contract, FastAPI request-query validation, stable public integration error responses, OpenAPI documentation, isolated API tests through dependency overrides, deterministic retry tests, collaboration tests across `VendorClient` and `RetryPolicy`, and a GitHub Actions CI pipeline that verifies formatting, linting, tests, coverage, and test reports.
+The current implementation includes validated application configuration with Pydantic Settings, explicit secret handling with `SecretStr`, retry configuration through environment-backed settings, a composition root that wires and owns integration resources, composition-root injection of a configurable resilience policy, a concrete HTTPX transport with Bearer authentication and deterministic cleanup, semantic upstream exception classification, configurable transient-failure retries, exponential backoff with full jitter, normalized `Retry-After` handling, `Retry-After`-aware scheduling, bounded provider-directed retry waits, strict nested upstream schemas, lazy vendor pagination, empty-page handling, cycle detection, non-monotonic pagination support, semantic vendor-data validation, fail-fast page consistency, explicit upstream-to-public mapping, separate upstream and public enums, deterministic contract normalization, unsupported-contract mapping detection, stable mapping-error translation, a paginated `GET /vendor/items?page=N` API contract, FastAPI request-query validation, stable public integration error responses, OpenAPI documentation, isolated API tests through dependency overrides, deterministic retry tests, collaboration tests across `VendorClient` and `RetryPolicy`, and a GitHub Actions CI pipeline that verifies formatting, linting, tests, coverage, and test reports.
 
 Retries are currently applied only to the vendor client's read operation. The project intentionally does not assume that future mutating operations are safe to retry merely because a failure is transient. Safe retries for future `POST`, `PUT`, or `DELETE` operations will require operation-specific semantics, provider guarantees, or mechanisms such as idempotency keys.
 
-The current suite contains 106 passing tests.
+The current suite contains 125 passing tests.

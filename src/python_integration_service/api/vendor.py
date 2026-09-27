@@ -4,11 +4,13 @@ from fastapi import APIRouter, Depends, Query
 
 from python_integration_service.api.schemas import (
     ErrorResponse,
-    ItemResponse,
     ItemsPageResponse,
 )
 from python_integration_service.dependencies import get_vendor_client
 from python_integration_service.integrations.vendor_client import VendorClient
+from python_integration_service.transformers.vendor import (
+    transform_vendor_items_page,
+)
 
 router = APIRouter(
     prefix="/vendor",
@@ -43,13 +45,4 @@ def get_vendor_items(
 ) -> ItemsPageResponse:
     vendor_page = vendor_client.get_items_page(page=page)
 
-    return ItemsPageResponse(
-        items=[
-            ItemResponse(
-                id=item.id,
-                name=item.name,
-            )
-            for item in vendor_page.items
-        ],
-        next_page=vendor_page.next_page,
-    )
+    return transform_vendor_items_page(vendor_page)

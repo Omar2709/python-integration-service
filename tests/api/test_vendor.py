@@ -11,6 +11,7 @@ from python_integration_service.integrations.exceptions import (
     AuthenticationError,
     IntegrationError,
     InvalidUpstreamResponseError,
+    MappingError,
     RateLimitError,
     UpstreamConnectionError,
     UpstreamServerError,
@@ -20,7 +21,10 @@ from python_integration_service.integrations.exceptions import (
 from python_integration_service.integrations.vendor_client import VendorClient
 from python_integration_service.integrations.vendor_schemas import (
     ItemsPage,
+    VendorCategory,
     VendorItem,
+    VendorItemAttributes,
+    VendorStatus,
 )
 
 
@@ -49,7 +53,11 @@ def test_get_vendor_items_returns_first_page_by_default(
         items=[
             VendorItem(
                 id=1,
-                name="Item 1",
+                attributes=VendorItemAttributes(
+                    display_name="  Item 1  ",
+                    category=VendorCategory.HARDWARE,
+                ),
+                status=VendorStatus.ENABLED,
             )
         ],
         next_page=2,
@@ -64,9 +72,43 @@ def test_get_vendor_items_returns_first_page_by_default(
             {
                 "id": 1,
                 "name": "Item 1",
+                "category": "hardware",
+                "active": True,
             }
         ],
         "next_page": 2,
+    }
+
+    vendor_client.get_items_page.assert_called_once_with(page=1)
+
+
+def test_get_vendor_items_returns_mapping_error_for_unsupported_category(
+    test_app: FastAPI,
+    vendor_client: MagicMock,
+) -> None:
+    vendor_client.get_items_page.return_value = ItemsPage(
+        items=[
+            VendorItem(
+                id=42,
+                attributes=VendorItemAttributes(
+                    display_name="Bundle",
+                    category=VendorCategory.BUNDLE,
+                ),
+                status=VendorStatus.ENABLED,
+            )
+        ],
+        next_page=None,
+    )
+
+    with TestClient(test_app) as client:
+        response = client.get("/vendor/items")
+
+    assert response.status_code == status.HTTP_502_BAD_GATEWAY
+    assert response.json() == {
+        "code": "upstream_mapping_error",
+        "detail": (
+            "The upstream data could not be adapted to the public API contract."
+        ),
     }
 
     vendor_client.get_items_page.assert_called_once_with(page=1)
@@ -135,6 +177,12 @@ def test_get_vendor_items_rejects_invalid_page_query(
             status.HTTP_502_BAD_GATEWAY,
             "upstream_invalid_response",
             "The upstream service returned an invalid response.",
+        ),
+        (
+            MappingError("internal mapping failed"),
+            status.HTTP_502_BAD_GATEWAY,
+            "upstream_mapping_error",
+            ("The upstream data could not be adapted to the public API contract."),
         ),
         (
             RateLimitError(

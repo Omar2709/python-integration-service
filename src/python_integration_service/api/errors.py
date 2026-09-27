@@ -8,6 +8,7 @@ from python_integration_service.integrations.exceptions import (
     AuthenticationError,
     IntegrationError,
     InvalidUpstreamResponseError,
+    MappingError,
     RateLimitError,
     UpstreamConnectionError,
     UpstreamServerError,
@@ -38,6 +39,21 @@ async def invalid_upstream_response_error_handler(
         content=ErrorResponse(
             code="upstream_invalid_response",
             detail="The upstream service returned an invalid response.",
+        ).model_dump(mode="json"),
+    )
+
+
+async def mapping_error_handler(
+    request: Request,
+    exc: Exception,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        content=ErrorResponse(
+            code="upstream_mapping_error",
+            detail=(
+                "The upstream data could not be adapted to the public API contract."
+            ),
         ).model_dump(mode="json"),
     )
 
@@ -134,6 +150,10 @@ def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(
         InvalidUpstreamResponseError,
         invalid_upstream_response_error_handler,
+    )
+    app.add_exception_handler(
+        MappingError,
+        mapping_error_handler,
     )
     app.add_exception_handler(
         RateLimitError,
