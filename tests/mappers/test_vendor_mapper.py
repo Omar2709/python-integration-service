@@ -9,26 +9,23 @@ from python_integration_service.integrations.exceptions import (
     UnsupportedVendorCategoryError,
 )
 from python_integration_service.integrations.vendor_schemas import (
-    ItemsPage,
     VendorCategory,
-    VendorItem,
-    VendorItemAttributes,
     VendorStatus,
 )
 from python_integration_service.mappers.vendor import (
     map_vendor_item,
     map_vendor_items_page,
 )
+from tests.factories.vendor import (
+    make_items_page,
+    make_vendor_item,
+)
 
 
 def test_map_vendor_item_transforms_upstream_item() -> None:
-    item = VendorItem(
-        id=42,
-        attributes=VendorItemAttributes(
-            display_name="  Mechanical Keyboard  ",
-            category=VendorCategory.HARDWARE,
-        ),
-        status=VendorStatus.ENABLED,
+    item = make_vendor_item(
+        item_id=42,
+        display_name="  Mechanical Keyboard  ",
     )
 
     result = map_vendor_item(item)
@@ -41,32 +38,38 @@ def test_map_vendor_item_transforms_upstream_item() -> None:
     )
 
 
-def test_map_vendor_item_maps_disabled_status_to_inactive() -> None:
-    item = VendorItem(
-        id=42,
-        attributes=VendorItemAttributes(
-            display_name="Mechanical Keyboard",
-            category=VendorCategory.HARDWARE,
+@pytest.mark.parametrize(
+    ("status", "expected_active"),
+    [
+        pytest.param(
+            VendorStatus.ENABLED,
+            True,
+            id="enabled",
         ),
-        status=VendorStatus.DISABLED,
+        pytest.param(
+            VendorStatus.DISABLED,
+            False,
+            id="disabled",
+        ),
+    ],
+)
+def test_map_vendor_item_maps_status_to_active(
+    status: VendorStatus,
+    expected_active: bool,
+) -> None:
+    item = make_vendor_item(
+        status=status,
     )
 
     result = map_vendor_item(item)
 
-    assert result.active is False
+    assert result.active is expected_active
 
 
 def test_map_vendor_items_page_maps_items_and_pagination() -> None:
-    page = ItemsPage(
+    page = make_items_page(
         items=[
-            VendorItem(
-                id=1,
-                attributes=VendorItemAttributes(
-                    display_name="Keyboard",
-                    category=VendorCategory.HARDWARE,
-                ),
-                status=VendorStatus.ENABLED,
-            )
+            make_vendor_item(),
         ],
         next_page=2,
     )
@@ -87,13 +90,10 @@ def test_map_vendor_items_page_maps_items_and_pagination() -> None:
 
 
 def test_map_vendor_item_rejects_unsupported_vendor_category() -> None:
-    item = VendorItem(
-        id=42,
-        attributes=VendorItemAttributes(
-            display_name="Bundle",
-            category=VendorCategory.BUNDLE,
-        ),
-        status=VendorStatus.ENABLED,
+    item = make_vendor_item(
+        item_id=42,
+        display_name="Bundle",
+        category=VendorCategory.BUNDLE,
     )
 
     with pytest.raises(

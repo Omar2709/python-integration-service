@@ -468,7 +468,6 @@ Therefore:
 ```text
 transient transport failure
 → retry may occur
-
 successful HTTP response with invalid payload
 → InvalidUpstreamResponseError
 → no retry
@@ -482,7 +481,6 @@ The vendor integration supports both page-level access and lazy iteration.
 
 ```python
 page = vendor_client.get_items_page(page=1)
-
 for item in vendor_client.iter_items():
     ...
 ```
@@ -766,31 +764,22 @@ Current internal mappings include:
 ```text
 HTTPX timeout
   -> UpstreamTimeoutError
-
 HTTPX network / connection failure
   -> UpstreamConnectionError
-
 401 upstream
   -> AuthenticationError
-
 429 upstream
   -> RateLimitError
-
 500 / 502 upstream
   -> UpstreamServerError
-
 503 upstream
   -> UpstreamUnavailableError
-
 504 upstream
   -> UpstreamTimeoutError
-
 Invalid upstream payload
   -> InvalidUpstreamResponseError
-
 Structurally valid but semantically invalid vendor data
   -> InvalidVendorDataError
-
 Valid upstream value without a supported public mapping
   -> UnsupportedVendorCategoryError
   -> MappingError
@@ -802,39 +791,30 @@ The FastAPI boundary then translates integration exceptions into the public API 
 AuthenticationError
   -> 502 Bad Gateway
   -> upstream_authentication_error
-
 InvalidUpstreamResponseError
   -> 502 Bad Gateway
   -> upstream_invalid_response
-
 InvalidVendorDataError
   -> 502 Bad Gateway
   -> upstream_invalid_response
-
 MappingError
   -> 502 Bad Gateway
   -> upstream_mapping_error
-
 RateLimitError
   -> 503 Service Unavailable
   -> upstream_rate_limited
-
 UpstreamConnectionError
   -> 502 Bad Gateway
   -> upstream_connection_error
-
 UpstreamServerError
   -> 502 Bad Gateway
   -> upstream_server_error
-
 UpstreamUnavailableError
   -> 503 Service Unavailable
   -> upstream_unavailable
-
 UpstreamTimeoutError
   -> 504 Gateway Timeout
   -> upstream_timeout
-
 IntegrationError
   -> 502 Bad Gateway
   -> upstream_integration_error
@@ -948,7 +928,6 @@ Therefore:
 
 ```text
 max_attempts = 3
-
 attempt 1 → initial call
 attempt 2 → first retry
 attempt 3 → second and final retry
@@ -970,13 +949,10 @@ For example:
 
 ```text
 base_delay = 1.0
-
 attempt 1 failure
 → jitter between 0 and 1 second
-
 attempt 2 failure
 → jitter between 0 and 2 seconds
-
 attempt 3 failure
 → jitter between 0 and 4 seconds
 ```
@@ -1277,10 +1253,101 @@ The suite also covers:
 - End-to-end unsupported-category API behavior.
 - Deterministic display-name normalization.
 
+### Advanced pytest fixtures and mocks
+
+The test suite uses explicit factories, scoped fixtures, parametrization, and strict mocks to keep tests readable and resistant to interface drift.
+
+#### Test-data factories
+
+Reusable vendor test data is built through explicit factory functions under:
+
+```text
+tests/factories/
+└── vendor.py
+```
+
+Factories are used for both:
+
+- Validated `VendorItem` / `ItemsPage` models.
+- Raw upstream payload dictionaries.
+
+These concerns remain separate so integration tests can still exercise the real validation boundary:
+
+```text
+raw provider payload
+        ↓
+VendorClient
+        ↓
+Pydantic validation
+        ↓
+validated vendor models
+```
+
+Factories provide sensible defaults while allowing each test to override only the fields relevant to the behavior being tested.
+
+#### Fixture scope and lifecycle
+
+FastAPI test fixtures remain function-scoped to preserve isolation between tests.
+
+```text
+test_app
+→ application configuration and dependency overrides
+client
+→ TestClient lifecycle and HTTP interaction
+```
+
+Application and client fixtures are kept separate so OpenAPI tests can inspect the app directly while endpoint tests depend only on the HTTP client.
+
+Shared fixtures are intentionally not moved into a global `conftest.py` unless multiple test modules genuinely need them.
+
+#### Strict mocks
+
+Architectural collaborators use autospecced mocks:
+
+```text
+VendorClient
+Transport
+RetryPolicy
+```
+
+with:
+
+```python
+create_autospec(..., instance=True, spec_set=True)
+```
+
+This protects tests against interface drift by validating available attributes and method signatures.
+
+Simple callbacks such as injected sleep or jitter functions continue to use lightweight mocks when stricter autospeccing would not add meaningful value.
+
+#### Parametrization
+
+`pytest.mark.parametrize` is used when the same behavior must be verified across multiple input/output combinations.
+
+Examples include:
+
+- Vendor status → public `active` state.
+- Blank-name variants.
+- Invalid pagination values.
+- Integration-error HTTP mappings.
+
+Readable parameter IDs are used where they improve CI failure diagnostics.
+
+#### Mocking strategy
+
+The suite follows these rules:
+
+- Mock architectural collaboration boundaries.
+- Avoid asserting internal implementation details.
+- Patch dependencies where they are looked up.
+- Use `monkeypatch` for temporary environment or state changes.
+- Use `unittest.mock.patch` when interaction assertions are required.
+- Prefer fakes only when repeated mock setup becomes more complex than the behavior under test.
+
 Current test count:
 
 ```text
-125 tests
+129 tests
 ```
 
 Run the suite with:
@@ -1458,29 +1525,24 @@ Configuration rules:
 VENDOR_BASE_URL
 → required
 → valid HTTP/HTTPS URL
-
 VENDOR_ACCESS_TOKEN
 → required
 → cannot be empty
 → cannot contain only whitespace
-
 VENDOR_TIMEOUT
 → optional
 → defaults to 30.0
 → must be greater than 0
-
 VENDOR_RETRY_MAX_ATTEMPTS
 → optional
 → defaults to 3
 → total executions, including the initial call
 → must be at least 1
-
 VENDOR_RETRY_BASE_DELAY
 → optional
 → defaults to 0.5
 → initial exponential-backoff window in seconds
 → must be greater than or equal to 0
-
 VENDOR_RETRY_MAX_RETRY_AFTER_SECONDS
 → optional
 → defaults to 60.0
@@ -1661,10 +1723,16 @@ The project will evolve incrementally.
 - [x] Unsupported-contract mapping detection.
 - [x] Stable public mapping-error responses.
 - [x] Deterministic contract normalization.
+- [x] Advanced pytest fixtures and mocks.
+- [x] Explicit vendor test-data factories.
+- [x] Separate raw-payload and validated-model factories.
+- [x] Function-scoped FastAPI test lifecycle.
+- [x] Strict autospecced architectural mocks.
+- [x] Behavioral parametrization with readable case IDs.
+- [x] Explicit patching and monkeypatching strategy.
 
 ### Next
 
-- [ ] Advanced pytest fixtures and mocks.
 - [ ] Client-side rate limiting.
 - [ ] Retry budget / retry deadline.
 - [ ] Idempotency-key support for safe retries of mutating operations.
@@ -1687,4 +1755,4 @@ The current implementation includes validated application configuration with Pyd
 
 Retries are currently applied only to the vendor client's read operation. The project intentionally does not assume that future mutating operations are safe to retry merely because a failure is transient. Safe retries for future `POST`, `PUT`, or `DELETE` operations will require operation-specific semantics, provider guarantees, or mechanisms such as idempotency keys.
 
-The current suite contains 125 passing tests.
+The current suite contains 129 passing tests.

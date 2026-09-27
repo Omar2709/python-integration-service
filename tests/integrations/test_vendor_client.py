@@ -1,4 +1,9 @@
-from unittest.mock import MagicMock, call
+from unittest.mock import (
+    MagicMock,
+    NonCallableMagicMock,
+    call,
+    create_autospec,
+)
 
 import pytest
 from pydantic import ValidationError
@@ -16,16 +21,33 @@ from python_integration_service.integrations.vendor_schemas import (
     VendorItemAttributes,
     VendorStatus,
 )
+from tests.factories.vendor import (
+    make_items_page_payload,
+    make_vendor_item_payload,
+)
 
 
-def make_retry_policy() -> MagicMock:
-    retry_policy = MagicMock(spec=RetryPolicy)
+def make_transport() -> NonCallableMagicMock:
+    return create_autospec(
+        Transport,
+        instance=True,
+        spec_set=True,
+    )
+
+
+def make_retry_policy() -> NonCallableMagicMock:
+    retry_policy = create_autospec(
+        RetryPolicy,
+        instance=True,
+        spec_set=True,
+    )
     retry_policy.execute.side_effect = lambda operation: operation()
+
     return retry_policy
 
 
 def test_get_executes_transport_through_retry_policy() -> None:
-    transport = MagicMock(spec=Transport)
+    transport = make_transport()
     transport.get.return_value = {
         "id": 1,
     }
@@ -49,13 +71,10 @@ def test_get_executes_transport_through_retry_policy() -> None:
 
 
 def test_get_retries_transient_failure_and_then_succeeds() -> None:
-    transport = MagicMock(spec=Transport)
+    transport = make_transport()
     transport.get.side_effect = [
         UpstreamTimeoutError("temporary timeout"),
-        {
-            "items": [],
-            "next_page": None,
-        },
+        make_items_page_payload(),
     ]
 
     sleep = MagicMock()
@@ -90,20 +109,15 @@ def test_get_retries_transient_failure_and_then_succeeds() -> None:
 
 
 def test_invalid_upstream_payload_is_not_retried() -> None:
-    transport = MagicMock(spec=Transport)
-    transport.get.return_value = {
-        "items": [
-            {
-                "id": "not-an-integer",
-                "attributes": {
-                    "display_name": "Broken item",
-                    "category": "hardware",
-                },
-                "status": "enabled",
-            }
-        ],
-        "next_page": None,
-    }
+    transport = make_transport()
+    transport.get.return_value = make_items_page_payload(
+        items=[
+            make_vendor_item_payload(
+                item_id="not-an-integer",
+                display_name="Broken item",
+            )
+        ]
+    )
 
     sleep = MagicMock()
     jitter = MagicMock()
@@ -132,22 +146,19 @@ def test_invalid_upstream_payload_is_not_retried() -> None:
 
 
 def test_get_items_page_validates_vendor_response() -> None:
-    transport = MagicMock(spec=Transport)
-    transport.get.return_value = {
-        "items": [
-            {
-                "id": 1,
-                "attributes": {
-                    "display_name": "Item 1",
-                    "category": "hardware",
-                },
-                "status": "enabled",
-                "created_at": "2026-09-26T12:00:00Z",
-            }
-        ],
-        "next_page": 2,
-        "request_id": "abc123",
-    }
+    transport = make_transport()
+
+    item_payload = make_vendor_item_payload()
+
+    item_payload["created_at"] = "2026-09-26T12:00:00Z"
+
+    payload = make_items_page_payload(
+        items=[item_payload],
+        next_page=2,
+    )
+    payload["request_id"] = "abc123"
+
+    transport.get.return_value = payload
 
     client = VendorClient(
         base_url="https://api.vendor.test",
@@ -175,38 +186,23 @@ def test_get_items_page_validates_vendor_response() -> None:
 @pytest.mark.parametrize(
     "payload",
     [
-        {
-            "items": [
-                {
-                    "id": "1",
-                    "attributes": {
-                        "display_name": "Item 1",
-                        "category": "hardware",
-                    },
-                    "status": "enabled",
-                }
-            ],
-            "next_page": None,
-        },
-        {
-            "items": [
-                {
-                    "id": 1,
-                    "attributes": {
-                        "display_name": "Item 1",
-                        "category": "hardware",
-                    },
-                    "status": "enabled",
-                }
-            ],
-            "next_page": "2",
-        },
+        make_items_page_payload(
+            items=[
+                make_vendor_item_payload(
+                    item_id="1",
+                )
+            ]
+        ),
+        make_items_page_payload(
+            items=[make_vendor_item_payload()],
+            next_page="2",
+        ),
     ],
 )
 def test_get_items_page_rejects_invalid_field_types(
-    payload: dict,
+    payload: dict[str, object],
 ) -> None:
-    transport = MagicMock(spec=Transport)
+    transport = make_transport()
     transport.get.return_value = payload
 
     client = VendorClient(
@@ -227,22 +223,12 @@ def test_get_items_page_rejects_invalid_field_types(
 @pytest.mark.parametrize(
     "item_payload",
     [
-        {
-            "id": 1,
-            "attributes": {
-                "display_name": "Item 1",
-                "category": "hardware",
-            },
-            "status": "archived",
-        },
-        {
-            "id": 1,
-            "attributes": {
-                "display_name": "Item 1",
-                "category": "unknown",
-            },
-            "status": "enabled",
-        },
+        make_vendor_item_payload(
+            status="archived",
+        ),
+        make_vendor_item_payload(
+            category="unknown",
+        ),
         {
             "id": 1,
             "status": "enabled",
@@ -250,13 +236,12 @@ def test_get_items_page_rejects_invalid_field_types(
     ],
 )
 def test_get_items_page_rejects_invalid_upstream_item_contract(
-    item_payload: dict,
+    item_payload: dict[str, object],
 ) -> None:
-    transport = MagicMock(spec=Transport)
-    transport.get.return_value = {
-        "items": [item_payload],
-        "next_page": None,
-    }
+    transport = make_transport()
+    transport.get.return_value = make_items_page_payload(
+        items=[item_payload],
+    )
 
     client = VendorClient(
         base_url="https://api.vendor.test",
@@ -284,11 +269,10 @@ def test_get_items_page_rejects_invalid_upstream_item_contract(
 def test_get_items_page_rejects_non_positive_next_page(
     next_page: int,
 ) -> None:
-    transport = MagicMock(spec=Transport)
-    transport.get.return_value = {
-        "items": [],
-        "next_page": next_page,
-    }
+    transport = make_transport()
+    transport.get.return_value = make_items_page_payload(
+        next_page=next_page,
+    )
 
     client = VendorClient(
         base_url="https://api.vendor.test",
@@ -315,7 +299,7 @@ def test_get_items_page_rejects_non_positive_next_page(
 def test_get_items_page_rejects_invalid_page_argument(
     page: int,
 ) -> None:
-    transport = MagicMock(spec=Transport)
+    transport = make_transport()
 
     client = VendorClient(
         base_url="https://api.vendor.test",
@@ -342,7 +326,7 @@ def test_get_items_page_rejects_invalid_page_argument(
 def test_iter_items_rejects_invalid_start_page(
     start_page: int,
 ) -> None:
-    transport = MagicMock(spec=Transport)
+    transport = make_transport()
 
     client = VendorClient(
         base_url="https://api.vendor.test",
@@ -362,34 +346,28 @@ def test_iter_items_rejects_invalid_start_page(
 
 
 def test_iter_items_fetches_pages_lazily() -> None:
-    transport = MagicMock(spec=Transport)
+    transport = make_transport()
     transport.get.side_effect = [
-        {
-            "items": [
-                {
-                    "id": 1,
-                    "attributes": {
-                        "display_name": "Item 1",
-                        "category": "hardware",
-                    },
-                    "status": "enabled",
-                }
+        make_items_page_payload(
+            items=[
+                make_vendor_item_payload(
+                    item_id=1,
+                    display_name="Item 1",
+                    category="hardware",
+                )
             ],
-            "next_page": 2,
-        },
-        {
-            "items": [
-                {
-                    "id": 2,
-                    "attributes": {
-                        "display_name": "Item 2",
-                        "category": "software",
-                    },
-                    "status": "disabled",
-                }
+            next_page=2,
+        ),
+        make_items_page_payload(
+            items=[
+                make_vendor_item_payload(
+                    item_id=2,
+                    display_name="Item 2",
+                    category="software",
+                    status="disabled",
+                )
             ],
-            "next_page": None,
-        },
+        ),
     ]
 
     client = VendorClient(
@@ -434,34 +412,26 @@ def test_iter_items_fetches_pages_lazily() -> None:
 
 
 def test_iter_items_rejects_cyclic_pagination() -> None:
-    transport = MagicMock(spec=Transport)
+    transport = make_transport()
     transport.get.side_effect = [
-        {
-            "items": [
-                {
-                    "id": 1,
-                    "attributes": {
-                        "display_name": "Item 1",
-                        "category": "hardware",
-                    },
-                    "status": "enabled",
-                }
+        make_items_page_payload(
+            items=[
+                make_vendor_item_payload(
+                    item_id=1,
+                    display_name="Item 1",
+                )
             ],
-            "next_page": 2,
-        },
-        {
-            "items": [
-                {
-                    "id": 2,
-                    "attributes": {
-                        "display_name": "Item 2",
-                        "category": "hardware",
-                    },
-                    "status": "enabled",
-                }
+            next_page=2,
+        ),
+        make_items_page_payload(
+            items=[
+                make_vendor_item_payload(
+                    item_id=2,
+                    display_name="Item 2",
+                )
             ],
-            "next_page": 1,
-        },
+            next_page=1,
+        ),
     ]
 
     client = VendorClient(
@@ -491,25 +461,20 @@ def test_iter_items_rejects_cyclic_pagination() -> None:
 
 
 def test_iter_items_skips_empty_pages_and_continues() -> None:
-    transport = MagicMock(spec=Transport)
+    transport = make_transport()
     transport.get.side_effect = [
-        {
-            "items": [],
-            "next_page": 2,
-        },
-        {
-            "items": [
-                {
-                    "id": 2,
-                    "attributes": {
-                        "display_name": "Item 2",
-                        "category": "accessory",
-                    },
-                    "status": "enabled",
-                }
+        make_items_page_payload(
+            next_page=2,
+        ),
+        make_items_page_payload(
+            items=[
+                make_vendor_item_payload(
+                    item_id=2,
+                    display_name="Item 2",
+                    category="accessory",
+                )
             ],
-            "next_page": None,
-        },
+        ),
     ]
 
     client = VendorClient(
@@ -538,11 +503,8 @@ def test_iter_items_skips_empty_pages_and_continues() -> None:
 
 
 def test_iter_items_stops_on_empty_final_page() -> None:
-    transport = MagicMock(spec=Transport)
-    transport.get.return_value = {
-        "items": [],
-        "next_page": None,
-    }
+    transport = make_transport()
+    transport.get.return_value = make_items_page_payload()
 
     client = VendorClient(
         base_url="https://api.vendor.test",
@@ -558,47 +520,38 @@ def test_iter_items_stops_on_empty_final_page() -> None:
 
 
 def test_iter_items_allows_non_monotonic_unvisited_pages() -> None:
-    transport = MagicMock(spec=Transport)
+    transport = make_transport()
     transport.get.side_effect = [
-        {
-            "items": [
-                {
-                    "id": 1,
-                    "attributes": {
-                        "display_name": "Item 1",
-                        "category": "hardware",
-                    },
-                    "status": "enabled",
-                }
+        make_items_page_payload(
+            items=[
+                make_vendor_item_payload(
+                    item_id=1,
+                    display_name="Item 1",
+                    category="hardware",
+                )
             ],
-            "next_page": 3,
-        },
-        {
-            "items": [
-                {
-                    "id": 2,
-                    "attributes": {
-                        "display_name": "Item 2",
-                        "category": "software",
-                    },
-                    "status": "enabled",
-                }
+            next_page=3,
+        ),
+        make_items_page_payload(
+            items=[
+                make_vendor_item_payload(
+                    item_id=2,
+                    display_name="Item 2",
+                    category="software",
+                )
             ],
-            "next_page": 2,
-        },
-        {
-            "items": [
-                {
-                    "id": 3,
-                    "attributes": {
-                        "display_name": "Item 3",
-                        "category": "accessory",
-                    },
-                    "status": "disabled",
-                }
+            next_page=2,
+        ),
+        make_items_page_payload(
+            items=[
+                make_vendor_item_payload(
+                    item_id=3,
+                    display_name="Item 3",
+                    category="accessory",
+                    status="disabled",
+                )
             ],
-            "next_page": None,
-        },
+        ),
     ]
 
     client = VendorClient(

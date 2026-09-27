@@ -1,4 +1,5 @@
-from unittest.mock import MagicMock
+from collections.abc import Iterator
+from unittest.mock import NonCallableMagicMock, create_autospec
 
 import pytest
 from fastapi import FastAPI, status
@@ -29,12 +30,18 @@ from python_integration_service.integrations.vendor_schemas import (
 
 
 @pytest.fixture
-def vendor_client() -> MagicMock:
-    return MagicMock(spec=VendorClient)
+def vendor_client() -> NonCallableMagicMock:
+    return create_autospec(
+        VendorClient,
+        instance=True,
+        spec_set=True,
+    )
 
 
 @pytest.fixture
-def test_app(vendor_client: MagicMock) -> FastAPI:
+def test_app(
+    vendor_client: NonCallableMagicMock,
+) -> Iterator[FastAPI]:
     app = FastAPI()
 
     app.include_router(router)
@@ -42,12 +49,22 @@ def test_app(vendor_client: MagicMock) -> FastAPI:
 
     app.dependency_overrides[get_vendor_client] = lambda: vendor_client
 
-    return app
+    yield app
+
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def client(
+    test_app: FastAPI,
+) -> Iterator[TestClient]:
+    with TestClient(test_app) as test_client:
+        yield test_client
 
 
 def test_get_vendor_items_returns_first_page_by_default(
-    test_app: FastAPI,
-    vendor_client: MagicMock,
+    client: TestClient,
+    vendor_client: NonCallableMagicMock,
 ) -> None:
     vendor_client.get_items_page.return_value = ItemsPage(
         items=[
@@ -63,8 +80,7 @@ def test_get_vendor_items_returns_first_page_by_default(
         next_page=2,
     )
 
-    with TestClient(test_app) as client:
-        response = client.get("/vendor/items")
+    response = client.get("/vendor/items")
 
     assert response.status_code == status.HTTP_200_OK
     assert response.json() == {
@@ -83,8 +99,8 @@ def test_get_vendor_items_returns_first_page_by_default(
 
 
 def test_get_vendor_items_returns_mapping_error_for_unsupported_category(
-    test_app: FastAPI,
-    vendor_client: MagicMock,
+    client: TestClient,
+    vendor_client: NonCallableMagicMock,
 ) -> None:
     vendor_client.get_items_page.return_value = ItemsPage(
         items=[
@@ -100,8 +116,7 @@ def test_get_vendor_items_returns_mapping_error_for_unsupported_category(
         next_page=None,
     )
 
-    with TestClient(test_app) as client:
-        response = client.get("/vendor/items")
+    response = client.get("/vendor/items")
 
     assert response.status_code == status.HTTP_502_BAD_GATEWAY
     assert response.json() == {
@@ -115,16 +130,15 @@ def test_get_vendor_items_returns_mapping_error_for_unsupported_category(
 
 
 def test_get_vendor_items_requests_selected_page(
-    test_app: FastAPI,
-    vendor_client: MagicMock,
+    client: TestClient,
+    vendor_client: NonCallableMagicMock,
 ) -> None:
     vendor_client.get_items_page.return_value = ItemsPage(
         items=[],
         next_page=None,
     )
 
-    with TestClient(test_app) as client:
-        response = client.get("/vendor/items?page=3")
+    response = client.get("/vendor/items?page=3")
 
     assert response.status_code == status.HTTP_200_OK
     assert response.json() == {
@@ -143,15 +157,14 @@ def test_get_vendor_items_requests_selected_page(
     ],
 )
 def test_get_vendor_items_rejects_invalid_page_query(
-    test_app: FastAPI,
-    vendor_client: MagicMock,
+    client: TestClient,
+    vendor_client: NonCallableMagicMock,
     page: int,
 ) -> None:
-    with TestClient(test_app) as client:
-        response = client.get(
-            "/vendor/items",
-            params={"page": page},
-        )
+    response = client.get(
+        "/vendor/items",
+        params={"page": page},
+    )
 
     assert response.status_code == status.HTTP_422_UNPROCESSABLE_CONTENT
 
@@ -228,8 +241,8 @@ def test_get_vendor_items_rejects_invalid_page_query(
     ],
 )
 def test_integration_errors_are_translated_to_public_http_responses(
-    test_app: FastAPI,
-    vendor_client: MagicMock,
+    client: TestClient,
+    vendor_client: NonCallableMagicMock,
     integration_exception: IntegrationError,
     expected_status: int,
     expected_code: str,
@@ -237,8 +250,7 @@ def test_integration_errors_are_translated_to_public_http_responses(
 ) -> None:
     vendor_client.get_items_page.side_effect = integration_exception
 
-    with TestClient(test_app) as client:
-        response = client.get("/vendor/items")
+    response = client.get("/vendor/items")
 
     assert response.status_code == expected_status
     assert response.json() == {
@@ -252,64 +264,60 @@ def test_integration_errors_are_translated_to_public_http_responses(
 
 
 def test_rate_limit_error_exposes_retry_after_seconds(
-    test_app: FastAPI,
-    vendor_client: MagicMock,
+    client: TestClient,
+    vendor_client: NonCallableMagicMock,
 ) -> None:
     vendor_client.get_items_page.side_effect = RateLimitError(
         "provider rate limit exceeded",
         retry_after_seconds=30.0,
     )
 
-    with TestClient(test_app) as client:
-        response = client.get("/vendor/items")
+    response = client.get("/vendor/items")
 
     assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
     assert response.headers["Retry-After"] == "30"
 
 
 def test_rate_limit_error_rounds_retry_after_up(
-    test_app: FastAPI,
-    vendor_client: MagicMock,
+    client: TestClient,
+    vendor_client: NonCallableMagicMock,
 ) -> None:
     vendor_client.get_items_page.side_effect = RateLimitError(
         "provider rate limit exceeded",
         retry_after_seconds=30.2,
     )
 
-    with TestClient(test_app) as client:
-        response = client.get("/vendor/items")
+    response = client.get("/vendor/items")
 
     assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
     assert response.headers["Retry-After"] == "31"
 
 
 def test_rate_limit_error_exposes_zero_retry_after(
-    test_app: FastAPI,
-    vendor_client: MagicMock,
+    client: TestClient,
+    vendor_client: NonCallableMagicMock,
 ) -> None:
     vendor_client.get_items_page.side_effect = RateLimitError(
         "provider rate limit exceeded",
         retry_after_seconds=0.0,
     )
 
-    with TestClient(test_app) as client:
-        response = client.get("/vendor/items")
+    response = client.get("/vendor/items")
 
     assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
     assert response.headers["Retry-After"] == "0"
 
 
 def test_rate_limit_error_omits_missing_retry_after(
-    test_app: FastAPI,
-    vendor_client: MagicMock,
+    client: TestClient,
+    vendor_client: NonCallableMagicMock,
 ) -> None:
     vendor_client.get_items_page.side_effect = RateLimitError(
         "provider rate limit exceeded",
         retry_after_seconds=None,
     )
 
-    with TestClient(test_app) as client:
-        response = client.get("/vendor/items")
+    response = client.get("/vendor/items")
 
     assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
     assert "Retry-After" not in response.headers
