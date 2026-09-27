@@ -81,6 +81,7 @@ python-integration-service/
 │       │   ├── page_iterator.py
 │       │   ├── pagination.py
 │       │   ├── resource_context.py
+│       │   ├── rate_limit.py
 │       │   ├── retry.py
 │       │   ├── transport.py
 │       │   ├── vendor_client.py
@@ -107,6 +108,7 @@ python-integration-service/
 │   │   ├── test_page_iterator.py
 │   │   ├── test_pagination.py
 │   │   ├── test_resource_context.py
+│   │   ├── test_rate_limit.py
 │   │   ├── test_retry.py
 │   │   └── test_vendor_client.py
 │   ├── mappers/
@@ -280,6 +282,9 @@ Current configuration includes:
 - Configurable maximum retry attempts.
 - Configurable initial exponential-backoff delay.
 - Configurable maximum accepted provider `Retry-After`.
+- Optional client-side rate limiting.
+- Positive request-rate and capacity validation.
+- Cross-field validation requiring rate-limit rate and capacity to be configured together.
 - Environment-variable loading.
 - Optional `.env` file loading.
 
@@ -292,6 +297,8 @@ VENDOR_TIMEOUT
 VENDOR_RETRY_MAX_ATTEMPTS
 VENDOR_RETRY_BASE_DELAY
 VENDOR_RETRY_MAX_RETRY_AFTER_SECONDS
+VENDOR_RATE_LIMIT_REQUESTS_PER_SECOND
+VENDOR_RATE_LIMIT_CAPACITY
 ```
 
 Configuration parsing and validation are intentionally kept separate from dependency construction.
@@ -351,9 +358,11 @@ Its current responsibilities include:
 - Extracting the real access-token value from `SecretStr`.
 - Converting `AnyHttpUrl` into the `str` expected by `VendorClient`.
 - Constructing `RetryPolicy` from validated settings.
+- Selecting `NoOpRateLimiter` or `TokenBucketRateLimiter` from validated settings.
 - Constructing `HttpxTransport`.
 - Constructing `VendorClient`.
 - Injecting the retry policy.
+- Injecting the selected rate limiter through the `RateLimiter` protocol.
 - Injecting the concrete transport through the `Transport` abstraction.
 - Owning the HTTP transport lifecycle through a context manager.
 
@@ -392,7 +401,7 @@ close httpx.Client
 
 Cleanup occurs both after normal execution and when an exception propagates from inside the context.
 
-This prevents Pydantic, environment loading, retry configuration, concrete HTTP construction, and resource-lifecycle concerns from leaking into `VendorClient`.
+This prevents Pydantic, environment loading, retry and rate-limit configuration, concrete HTTP construction, and resource-lifecycle concerns from leaking into `VendorClient`.
 
 ### HTTPX transport
 
@@ -429,6 +438,7 @@ Current responsibilities include:
 - Base URL ownership.
 - URL construction.
 - Delegation of outbound read requests through `RetryPolicy`.
+- Per-attempt rate-limit acquisition through the injected `RateLimiter`.
 - Delegation of actual outbound I/O to a `Transport`.
 - Fetching individual vendor pages through `get_items_page()`.
 - Lazy multi-page traversal through `iter_items()`.
@@ -436,7 +446,7 @@ Current responsibilities include:
 - Translation of invalid upstream payloads into semantic integration errors.
 - Pagination cycle detection.
 
-HTTP authentication, timeout configuration, environment-variable loading, retry configuration, configuration parsing, and transport lifecycle management are intentionally kept outside `VendorClient`.
+HTTP authentication, timeout configuration, environment-variable loading, retry configuration, rate-limit configuration, configuration parsing, and transport lifecycle management are intentionally kept outside `VendorClient`.
 
 Conceptually:
 
@@ -444,6 +454,7 @@ Conceptually:
 VendorClient
 ├── base_url
 ├── retry_policy
+├── rate_limiter
 ├── build_url()
 ├── get()
 ├── get_items_page()
@@ -457,6 +468,8 @@ The current retry boundary is intentionally narrow:
 VendorClient.get()
     ↓
 RetryPolicy.execute()
+    ↓ each attempt
+RateLimiter.acquire()
     ↓
 Transport.get()
 ```
@@ -967,6 +980,8 @@ Retries are currently applied to the vendor client's read operation:
 VendorClient.get()
     ↓
 RetryPolicy.execute()
+    ↓ each attempt
+RateLimiter.acquire()
     ↓
 Transport.get()
 ```
@@ -1057,6 +1072,167 @@ retry_after_seconds = 30.2
 Rounding upward prevents downstream consumers from being instructed to retry earlier than the semantic delay represented internally.
 
 An upstream rate limit is exposed as `503 Service Unavailable`, because the limit belongs to the service-to-provider interaction rather than necessarily representing a rate limit imposed directly on the API consumer.
+
+### Client-side rate limiting
+
+The vendor integration supports optional client-side rate limiting through a thread-safe token bucket.
+
+Client-side rate limiting is proactive:
+
+```text
+VendorClient
+        ↓
+RetryPolicy
+        ↓ each physical attempt
+RateLimiter.acquire()
+        ↓
+Transport
+        ↓
+upstream provider
+```
+
+Every physical HTTP attempt, including retries, must acquire rate-limit capacity independently.
+
+This differs from provider-side rate-limit handling:
+
+```text
+client-side rate limiter
+→ proactively controls local request throughput
+HTTP 429 + Retry-After
+→ reactively communicates the provider's authoritative limit
+```
+
+The local limiter reduces the probability of exceeding an upstream quota, but does not replace `429` handling because provider quotas may be shared across multiple application instances, credentials, or external consumers.
+
+#### RateLimiter contract
+
+The vendor client depends on a small structural contract:
+
+```text
+RateLimiter Protocol
+├── NoOpRateLimiter
+└── TokenBucketRateLimiter
+```
+
+`VendorClient` always collaborates with:
+
+```python
+self.rate_limiter.acquire()
+```
+
+It does not contain an `if rate_limiting_enabled` branch. The composition root selects the concrete implementation: `NoOpRateLimiter` when local rate limiting is disabled and `TokenBucketRateLimiter` when it is configured.
+
+#### Token bucket
+
+The current implementation uses a token-bucket algorithm.
+
+Configuration separates:
+
+```text
+requests_per_second
+→ sustained throughput
+capacity
+→ maximum accumulated burst
+```
+
+Tokens are stored internally as floating-point values so fractional refill capacity is preserved.
+
+The bucket starts full, allowing the configured burst immediately.
+
+Token replenishment uses a monotonic clock:
+
+```text
+elapsed = now - last_refill
+refill = elapsed * requests_per_second
+tokens = min(
+    capacity,
+    tokens + refill,
+)
+```
+
+A request consumes `1.0` token.
+
+If no token is available, the synchronous limiter calculates the required wait, releases its lock, sleeps, and then recomputes bucket state before attempting to acquire capacity again.
+
+A small numerical tolerance protects acquisition from normal floating-point representation effects near a complete token while preserving a non-negative token count.
+
+#### Thread safety
+
+Bucket state is protected by a lock.
+
+The following operations form one critical section:
+
+```text
+refill
+→ inspect available tokens
+→ consume token or calculate wait
+```
+
+Blocking sleep intentionally happens outside the lock so one waiting request does not prevent other threads from inspecting the bucket.
+
+After waking, a thread reacquires the lock and recalculates state because another thread may have consumed newly replenished capacity.
+
+The implementation does not currently guarantee FIFO fairness.
+
+The concurrent test verifies an observable invariant: with one available token and two contending threads, exactly one acquisition can complete immediately while the other waits for replenished capacity. This increases confidence in the synchronization design, but a single concurrent test is not a formal proof that every possible race condition is impossible.
+
+#### Optional configuration
+
+Client-side rate limiting is disabled by default.
+
+Both settings must be configured together:
+
+```text
+VENDOR_RATE_LIMIT_REQUESTS_PER_SECOND
+VENDOR_RATE_LIMIT_CAPACITY
+```
+
+Configuration rules:
+
+```text
+both absent
+→ disabled
+→ NoOpRateLimiter
+both present
+→ enabled
+→ TokenBucketRateLimiter
+only one present
+→ invalid configuration
+→ application startup fails
+```
+
+No default provider quota is invented by the application.
+
+Example:
+
+```env
+VENDOR_RATE_LIMIT_REQUESTS_PER_SECOND=10
+VENDOR_RATE_LIMIT_CAPACITY=20
+```
+
+The rate supports fractional values such as:
+
+```text
+0.5 requests/second
+```
+
+while capacity is a positive integer representing complete requests.
+
+#### Local scope
+
+The current limiter is process-local.
+
+If the application later scales horizontally:
+
+```text
+instance A → local bucket
+instance B → local bucket
+instance C → local bucket
+```
+
+the instances do not coordinate a global quota.
+
+A future distributed implementation, for example Redis-backed rate limiting, can implement the same `RateLimiter` protocol if globally coordinated quotas become necessary.
 
 ### Generators and lazy iteration
 
@@ -1253,6 +1429,28 @@ The suite also covers:
 - End-to-end unsupported-category API behavior.
 - Deterministic display-name normalization.
 
+### Client-side rate-limit coverage
+
+Client-side rate-limit coverage includes:
+
+- Full initial bucket capacity.
+- Burst-capacity behavior.
+- Blocking after capacity exhaustion.
+- Fractional token refill.
+- Refill capping at maximum capacity.
+- Recalculation after wake-up.
+- Rejection of invalid request rates.
+- Rejection of invalid capacities.
+- Immediate `NoOpRateLimiter` acquisition.
+- Disabled-by-default configuration.
+- Partial configuration rejection.
+- Composition-root implementation selection.
+- `VendorClient` collaboration with `RateLimiter`.
+- One acquisition per physical retry attempt.
+- Deterministic concurrent token acquisition.
+
+The concurrent test verifies observable behavior with coordinated threads rather than inspecting the internal lock or depending on real sleeps for functional timing. It increases confidence in the thread-safety invariant without claiming to formally prove the absence of every possible race condition.
+
 ### Advanced pytest fixtures and mocks
 
 The test suite uses explicit factories, scoped fixtures, parametrization, and strict mocks to keep tests readable and resistant to interface drift.
@@ -1347,7 +1545,7 @@ The suite follows these rules:
 Current test count:
 
 ```text
-129 tests
+151 tests
 ```
 
 Run the suite with:
@@ -1517,6 +1715,9 @@ VENDOR_TIMEOUT=30
 VENDOR_RETRY_MAX_ATTEMPTS=3
 VENDOR_RETRY_BASE_DELAY=0.5
 VENDOR_RETRY_MAX_RETRY_AFTER_SECONDS=60
+# Optional: configure both values together to enable local rate limiting
+VENDOR_RATE_LIMIT_REQUESTS_PER_SECOND=10
+VENDOR_RATE_LIMIT_CAPACITY=20
 ```
 
 Configuration rules:
@@ -1533,6 +1734,18 @@ VENDOR_TIMEOUT
 → optional
 → defaults to 30.0
 → must be greater than 0
+VENDOR_RATE_LIMIT_REQUESTS_PER_SECOND
+→ optional
+→ no default provider quota is assumed
+→ must be greater than 0 when configured
+→ supports fractional rates such as 0.5 requests/second
+VENDOR_RATE_LIMIT_CAPACITY
+→ optional
+→ no default burst capacity is assumed
+→ must be at least 1 when configured
+VENDOR_RATE_LIMIT_REQUESTS_PER_SECOND + VENDOR_RATE_LIMIT_CAPACITY
+→ must either both be absent or both be present
+→ partial configuration is rejected during Settings validation
 VENDOR_RETRY_MAX_ATTEMPTS
 → optional
 → defaults to 3
@@ -1612,6 +1825,10 @@ The project follows several principles that will guide future changes:
 - Do not automatically apply read-operation retry behavior to future mutating operations.
 - Respect provider `Retry-After` instructions without retrying earlier than requested.
 - Avoid unbounded provider-directed waits inside the retry policy.
+- Keep proactive client-side rate limiting separate from reactive provider `429` handling.
+- Apply local rate-limit acquisition to every physical retry attempt.
+- Do not invent provider quotas when client-side rate limiting is not explicitly configured.
+- Keep rate-limiter implementation selection in the composition root.
 - Never silently swallow exceptions.
 - Preserve original exceptions and tracebacks when possible.
 - Avoid hardcoding credentials.
@@ -1730,10 +1947,21 @@ The project will evolve incrementally.
 - [x] Strict autospecced architectural mocks.
 - [x] Behavioral parametrization with readable case IDs.
 - [x] Explicit patching and monkeypatching strategy.
+- [x] Client-side rate limiting.
+- [x] RateLimiter protocol.
+- [x] No-op rate limiter for disabled configuration.
+- [x] Thread-safe token-bucket implementation.
+- [x] Monotonic-clock token replenishment.
+- [x] Fractional token accounting.
+- [x] Configurable sustained rate and burst capacity.
+- [x] Cross-field rate-limit configuration validation.
+- [x] Composition-root rate-limiter selection.
+- [x] Per-retry-attempt rate-limit acquisition.
+- [x] Deterministic rate-limit tests.
+- [x] Concurrent token-acquisition test.
 
 ### Next
 
-- [ ] Client-side rate limiting.
 - [ ] Retry budget / retry deadline.
 - [ ] Idempotency-key support for safe retries of mutating operations.
 - [ ] Explicit retry semantics for future mutating operations.
@@ -1751,8 +1979,8 @@ This repository is under active development and is intentionally built in small,
 
 Each phase adds a focused backend concept together with tests before moving to the next topic.
 
-The current implementation includes validated application configuration with Pydantic Settings, explicit secret handling with `SecretStr`, retry configuration through environment-backed settings, a composition root that wires and owns integration resources, composition-root injection of a configurable resilience policy, a concrete HTTPX transport with Bearer authentication and deterministic cleanup, semantic upstream exception classification, configurable transient-failure retries, exponential backoff with full jitter, normalized `Retry-After` handling, `Retry-After`-aware scheduling, bounded provider-directed retry waits, strict nested upstream schemas, lazy vendor pagination, empty-page handling, cycle detection, non-monotonic pagination support, semantic vendor-data validation, fail-fast page consistency, explicit upstream-to-public mapping, separate upstream and public enums, deterministic contract normalization, unsupported-contract mapping detection, stable mapping-error translation, a paginated `GET /vendor/items?page=N` API contract, FastAPI request-query validation, stable public integration error responses, OpenAPI documentation, isolated API tests through dependency overrides, deterministic retry tests, collaboration tests across `VendorClient` and `RetryPolicy`, and a GitHub Actions CI pipeline that verifies formatting, linting, tests, coverage, and test reports.
+The current implementation includes validated application configuration with Pydantic Settings, explicit secret handling with `SecretStr`, retry configuration through environment-backed settings, a composition root that wires and owns integration resources, composition-root injection of a configurable resilience policy, a concrete HTTPX transport with Bearer authentication and deterministic cleanup, semantic upstream exception classification, configurable transient-failure retries, exponential backoff with full jitter, normalized `Retry-After` handling, `Retry-After`-aware scheduling, bounded provider-directed retry waits, strict nested upstream schemas, lazy vendor pagination, empty-page handling, cycle detection, non-monotonic pagination support, semantic vendor-data validation, fail-fast page consistency, explicit upstream-to-public mapping, separate upstream and public enums, deterministic contract normalization, unsupported-contract mapping detection, stable mapping-error translation, a paginated `GET /vendor/items?page=N` API contract, FastAPI request-query validation, stable public integration error responses, OpenAPI documentation, isolated API tests through dependency overrides, deterministic retry tests, collaboration tests across `VendorClient` and `RetryPolicy`, optional process-local client-side rate limiting through a thread-safe token bucket, a structural `RateLimiter` contract with no-op and token-bucket implementations, per-retry-attempt capacity acquisition, deterministic monotonic-clock refill behavior, concurrent acquisition coverage, and a GitHub Actions CI pipeline that verifies formatting, linting, tests, coverage, and test reports.
 
 Retries are currently applied only to the vendor client's read operation. The project intentionally does not assume that future mutating operations are safe to retry merely because a failure is transient. Safe retries for future `POST`, `PUT`, or `DELETE` operations will require operation-specific semantics, provider guarantees, or mechanisms such as idempotency keys.
 
-The current suite contains 129 passing tests.
+The current suite contains 151 passing tests.

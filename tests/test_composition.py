@@ -15,6 +15,8 @@ def make_settings() -> Settings:
         vendor_retry_max_attempts=4,
         vendor_retry_base_delay=0.75,
         vendor_retry_max_retry_after_seconds=120.0,
+        vendor_rate_limit_requests_per_second=None,
+        vendor_rate_limit_capacity=None,
     )
 
 
@@ -49,6 +51,45 @@ def test_create_vendor_client_wires_dependencies() -> None:
             assert client.base_url == "https://api.example.com/"
             assert client.transport is transport
             assert client.retry_policy is retry_policy
+
+
+def test_create_vendor_client_uses_no_op_rate_limiter_when_disabled() -> None:
+    settings = make_settings()
+
+    with (
+        patch("python_integration_service.composition.HttpxTransport"),
+        patch("python_integration_service.composition.NoOpRateLimiter") as no_op_class,
+        create_vendor_client(settings) as client,
+    ):
+        assert client.rate_limiter is no_op_class.return_value
+
+    no_op_class.assert_called_once_with()
+
+
+def test_create_vendor_client_configures_token_bucket_rate_limiter() -> None:
+    settings = Settings(
+        vendor_base_url=AnyHttpUrl("https://api.example.com"),
+        vendor_access_token=SecretStr("test-token"),
+        vendor_timeout=15.0,
+        vendor_retry_max_attempts=4,
+        vendor_retry_base_delay=0.75,
+        vendor_retry_max_retry_after_seconds=120.0,
+        vendor_rate_limit_requests_per_second=2.5,
+        vendor_rate_limit_capacity=10,
+    )
+
+    with (
+        patch("python_integration_service.composition.HttpxTransport"),
+        patch(
+            "python_integration_service.composition.TokenBucketRateLimiter"
+        ) as limiter_class,
+        create_vendor_client(settings) as client,
+    ):
+        limiter_class.assert_called_once_with(
+            requests_per_second=2.5,
+            capacity=10,
+        )
+        assert client.rate_limiter is limiter_class.return_value
 
 
 def test_create_vendor_client_exits_transport_context() -> None:

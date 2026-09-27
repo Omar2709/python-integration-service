@@ -12,6 +12,7 @@ from python_integration_service.integrations.exceptions import (
     InvalidUpstreamResponseError,
     UpstreamTimeoutError,
 )
+from python_integration_service.integrations.rate_limit import RateLimiter
 from python_integration_service.integrations.retry import RetryPolicy
 from python_integration_service.integrations.transport import Transport
 from python_integration_service.integrations.vendor_client import VendorClient
@@ -46,6 +47,14 @@ def make_retry_policy() -> NonCallableMagicMock:
     return retry_policy
 
 
+def make_rate_limiter() -> NonCallableMagicMock:
+    return create_autospec(
+        RateLimiter,
+        instance=True,
+        spec_set=True,
+    )
+
+
 def test_get_executes_transport_through_retry_policy() -> None:
     transport = make_transport()
     transport.get.return_value = {
@@ -53,11 +62,13 @@ def test_get_executes_transport_through_retry_policy() -> None:
     }
 
     retry_policy = make_retry_policy()
+    rate_limiter = make_rate_limiter()
 
     client = VendorClient(
         base_url="https://api.vendor.test",
         transport=transport,
         retry_policy=retry_policy,
+        rate_limiter=rate_limiter,
     )
 
     result = client.get("/items")
@@ -67,6 +78,7 @@ def test_get_executes_transport_through_retry_policy() -> None:
     }
 
     retry_policy.execute.assert_called_once()
+    rate_limiter.acquire.assert_called_once_with()
     transport.get.assert_called_once_with("https://api.vendor.test/items")
 
 
@@ -92,6 +104,7 @@ def test_get_retries_transient_failure_and_then_succeeds() -> None:
         base_url="https://api.vendor.test",
         transport=transport,
         retry_policy=retry_policy,
+        rate_limiter=make_rate_limiter(),
     )
 
     page = client.get_items_page(page=1)
@@ -106,6 +119,36 @@ def test_get_retries_transient_failure_and_then_succeeds() -> None:
         1.0,
     )
     sleep.assert_called_once_with(0.25)
+
+
+def test_retry_attempts_acquire_rate_limit_capacity_independently() -> None:
+    transport = make_transport()
+    transport.get.side_effect = [
+        UpstreamTimeoutError("temporary timeout"),
+        make_items_page_payload(),
+    ]
+
+    rate_limiter = make_rate_limiter()
+
+    retry_policy = RetryPolicy(
+        max_attempts=2,
+        base_delay=0.0,
+        max_retry_after_seconds=60.0,
+        sleep=MagicMock(),
+        jitter=MagicMock(return_value=0.0),
+    )
+
+    client = VendorClient(
+        base_url="https://api.vendor.test",
+        transport=transport,
+        retry_policy=retry_policy,
+        rate_limiter=rate_limiter,
+    )
+
+    client.get_items_page(page=1)
+
+    assert rate_limiter.acquire.call_count == 2
+    assert transport.get.call_count == 2
 
 
 def test_invalid_upstream_payload_is_not_retried() -> None:
@@ -134,6 +177,7 @@ def test_invalid_upstream_payload_is_not_retried() -> None:
         base_url="https://api.vendor.test",
         transport=transport,
         retry_policy=retry_policy,
+        rate_limiter=make_rate_limiter(),
     )
 
     with pytest.raises(InvalidUpstreamResponseError):
@@ -164,6 +208,7 @@ def test_get_items_page_validates_vendor_response() -> None:
         base_url="https://api.vendor.test",
         transport=transport,
         retry_policy=make_retry_policy(),
+        rate_limiter=make_rate_limiter(),
     )
 
     page = client.get_items_page(page=1)
@@ -209,6 +254,7 @@ def test_get_items_page_rejects_invalid_field_types(
         base_url="https://api.vendor.test",
         transport=transport,
         retry_policy=make_retry_policy(),
+        rate_limiter=make_rate_limiter(),
     )
 
     with pytest.raises(InvalidUpstreamResponseError) as exc_info:
@@ -247,6 +293,7 @@ def test_get_items_page_rejects_invalid_upstream_item_contract(
         base_url="https://api.vendor.test",
         transport=transport,
         retry_policy=make_retry_policy(),
+        rate_limiter=make_rate_limiter(),
     )
 
     with pytest.raises(InvalidUpstreamResponseError) as exc_info:
@@ -278,6 +325,7 @@ def test_get_items_page_rejects_non_positive_next_page(
         base_url="https://api.vendor.test",
         transport=transport,
         retry_policy=make_retry_policy(),
+        rate_limiter=make_rate_limiter(),
     )
 
     with pytest.raises(InvalidUpstreamResponseError) as exc_info:
@@ -305,6 +353,7 @@ def test_get_items_page_rejects_invalid_page_argument(
         base_url="https://api.vendor.test",
         transport=transport,
         retry_policy=make_retry_policy(),
+        rate_limiter=make_rate_limiter(),
     )
 
     with pytest.raises(
@@ -332,6 +381,7 @@ def test_iter_items_rejects_invalid_start_page(
         base_url="https://api.vendor.test",
         transport=transport,
         retry_policy=make_retry_policy(),
+        rate_limiter=make_rate_limiter(),
     )
 
     items = client.iter_items(start_page=start_page)
@@ -374,6 +424,7 @@ def test_iter_items_fetches_pages_lazily() -> None:
         base_url="https://api.vendor.test",
         transport=transport,
         retry_policy=make_retry_policy(),
+        rate_limiter=make_rate_limiter(),
     )
 
     items = client.iter_items()
@@ -438,6 +489,7 @@ def test_iter_items_rejects_cyclic_pagination() -> None:
         base_url="https://api.vendor.test",
         transport=transport,
         retry_policy=make_retry_policy(),
+        rate_limiter=make_rate_limiter(),
     )
 
     items = client.iter_items()
@@ -481,6 +533,7 @@ def test_iter_items_skips_empty_pages_and_continues() -> None:
         base_url="https://api.vendor.test",
         transport=transport,
         retry_policy=make_retry_policy(),
+        rate_limiter=make_rate_limiter(),
     )
 
     items = list(client.iter_items())
@@ -510,6 +563,7 @@ def test_iter_items_stops_on_empty_final_page() -> None:
         base_url="https://api.vendor.test",
         transport=transport,
         retry_policy=make_retry_policy(),
+        rate_limiter=make_rate_limiter(),
     )
 
     items = list(client.iter_items())
@@ -558,6 +612,7 @@ def test_iter_items_allows_non_monotonic_unvisited_pages() -> None:
         base_url="https://api.vendor.test",
         transport=transport,
         retry_policy=make_retry_policy(),
+        rate_limiter=make_rate_limiter(),
     )
 
     items = list(client.iter_items(start_page=1))

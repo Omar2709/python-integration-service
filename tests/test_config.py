@@ -19,6 +19,14 @@ def valid_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "VENDOR_RETRY_MAX_RETRY_AFTER_SECONDS",
         "120",
     )
+    monkeypatch.delenv(
+        "VENDOR_RATE_LIMIT_REQUESTS_PER_SECOND",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "VENDOR_RATE_LIMIT_CAPACITY",
+        raising=False,
+    )
 
 
 def test_loads_valid_settings(valid_env: None) -> None:
@@ -65,6 +73,114 @@ def test_uses_default_retry_settings(
     assert settings.vendor_retry_max_attempts == 3
     assert settings.vendor_retry_base_delay == 0.5
     assert settings.vendor_retry_max_retry_after_seconds == 60.0
+
+
+def test_rate_limiting_is_disabled_by_default(
+    valid_env: None,
+) -> None:
+    settings = load_settings_from_env()
+
+    assert settings.vendor_rate_limit_requests_per_second is None
+    assert settings.vendor_rate_limit_capacity is None
+
+
+def test_loads_rate_limit_configuration(
+    valid_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "VENDOR_RATE_LIMIT_REQUESTS_PER_SECOND",
+        "2.5",
+    )
+    monkeypatch.setenv(
+        "VENDOR_RATE_LIMIT_CAPACITY",
+        "10",
+    )
+
+    settings = load_settings_from_env()
+
+    assert settings.vendor_rate_limit_requests_per_second == 2.5
+    assert settings.vendor_rate_limit_capacity == 10
+
+
+@pytest.mark.parametrize(
+    ("variable_name", "value"),
+    [
+        pytest.param(
+            "VENDOR_RATE_LIMIT_REQUESTS_PER_SECOND",
+            "2.5",
+            id="missing-capacity",
+        ),
+        pytest.param(
+            "VENDOR_RATE_LIMIT_CAPACITY",
+            "10",
+            id="missing-rate",
+        ),
+    ],
+)
+def test_rejects_partial_rate_limit_configuration(
+    valid_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    variable_name: str,
+    value: str,
+) -> None:
+    monkeypatch.setenv(variable_name, value)
+
+    with pytest.raises(
+        ValidationError,
+        match="must be configured together",
+    ):
+        load_settings_from_env()
+
+
+@pytest.mark.parametrize(
+    "rate",
+    [
+        pytest.param("0", id="zero"),
+        pytest.param("-1", id="negative"),
+    ],
+)
+def test_rejects_non_positive_rate_limit_rate(
+    valid_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    rate: str,
+) -> None:
+    monkeypatch.setenv(
+        "VENDOR_RATE_LIMIT_REQUESTS_PER_SECOND",
+        rate,
+    )
+    monkeypatch.setenv(
+        "VENDOR_RATE_LIMIT_CAPACITY",
+        "1",
+    )
+
+    with pytest.raises(ValidationError):
+        load_settings_from_env()
+
+
+@pytest.mark.parametrize(
+    "capacity",
+    [
+        pytest.param("0", id="zero"),
+        pytest.param("-1", id="negative"),
+    ],
+)
+def test_rejects_non_positive_rate_limit_capacity(
+    valid_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capacity: str,
+) -> None:
+    monkeypatch.setenv(
+        "VENDOR_RATE_LIMIT_REQUESTS_PER_SECOND",
+        "1.0",
+    )
+    monkeypatch.setenv(
+        "VENDOR_RATE_LIMIT_CAPACITY",
+        capacity,
+    )
+
+    with pytest.raises(ValidationError):
+        load_settings_from_env()
 
 
 def test_invalid_base_url_raises_validation_error(
