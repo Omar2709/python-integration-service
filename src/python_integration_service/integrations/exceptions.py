@@ -2,6 +2,10 @@ class IntegrationError(Exception):
     """Base exception for all integration errors."""
 
 
+class RetryBudgetExceededError(IntegrationError):
+    """Raised when no retry can be scheduled within the configured time budget."""
+
+
 class ConfigurationError(IntegrationError):
     """Raised when integration configuration is invalid."""
 

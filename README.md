@@ -200,6 +200,7 @@ Current exception types include:
 - `IntegrationError`
 - `ConfigurationError`
 - `AuthenticationError`
+- `RetryBudgetExceededError`
 - `InvalidUpstreamResponseError`
 - `InvalidVendorDataError`
 - `MappingError`
@@ -211,13 +212,14 @@ Current exception types include:
 - `UpstreamServerError`
 - `UpstreamUnavailableError`
 
-The hierarchy separates invalid upstream data, adaptation failures, and transient operational failures:
+The hierarchy separates invalid upstream data, adaptation failures, retry-policy termination, and transient operational failures:
 
 ```text
 IntegrationError
 |
 +-- ConfigurationError
 +-- AuthenticationError
++-- RetryBudgetExceededError
 |
 +-- InvalidUpstreamResponseError
 |   |
@@ -236,6 +238,10 @@ IntegrationError
     +-- UpstreamUnavailableError
 ```
 
+`RetryBudgetExceededError` represents terminal exhaustion of the configured retry-scheduling time budget.
+
+It intentionally does not inherit from `TransientIntegrationError` because the current retry context must not automatically retry it again. The last transient upstream failure is preserved through Python exception chaining for internal diagnostics.
+
 `InvalidUpstreamResponseError` represents a provider response that was successfully received at the transport level but does not satisfy the integration contract.
 
 `InvalidVendorDataError` represents structurally valid upstream data that violates application-specific semantic invariants, such as a `display_name` that becomes blank after trimming.
@@ -244,7 +250,7 @@ IntegrationError
 
 `UnsupportedVendorCategoryError` is used when the provider returns a valid category for which the public API has no explicit mapping.
 
-These failures intentionally do not inherit from `TransientIntegrationError`, because immediate retries are not expected to correct invalid data or unsupported contract adaptation.
+These failures intentionally do not inherit from `TransientIntegrationError`, because immediate retries are not expected to correct invalid data, unsupported contract adaptation, or an already exhausted retry budget.
 
 This allows higher-level application code to distinguish integration-specific failures while applying resilience policies only to genuinely transient failures.
 
@@ -282,6 +288,7 @@ Current configuration includes:
 - Configurable maximum retry attempts.
 - Configurable initial exponential-backoff delay.
 - Configurable maximum accepted provider `Retry-After`.
+- Optional retry-scheduling time budget.
 - Optional client-side rate limiting.
 - Positive request-rate and capacity validation.
 - Cross-field validation requiring rate-limit rate and capacity to be configured together.
@@ -297,6 +304,7 @@ VENDOR_TIMEOUT
 VENDOR_RETRY_MAX_ATTEMPTS
 VENDOR_RETRY_BASE_DELAY
 VENDOR_RETRY_MAX_RETRY_AFTER_SECONDS
+VENDOR_RETRY_BUDGET_SECONDS
 VENDOR_RATE_LIMIT_REQUESTS_PER_SECOND
 VENDOR_RATE_LIMIT_CAPACITY
 ```
@@ -358,6 +366,7 @@ Its current responsibilities include:
 - Extracting the real access-token value from `SecretStr`.
 - Converting `AnyHttpUrl` into the `str` expected by `VendorClient`.
 - Constructing `RetryPolicy` from validated settings.
+- Passing the optional retry budget into `RetryPolicy`.
 - Selecting `NoOpRateLimiter` or `TokenBucketRateLimiter` from validated settings.
 - Constructing `HttpxTransport`.
 - Constructing `VendorClient`.
@@ -796,6 +805,8 @@ Structurally valid but semantically invalid vendor data
 Valid upstream value without a supported public mapping
   -> UnsupportedVendorCategoryError
   -> MappingError
+Retry scheduling time budget exhausted
+  -> RetryBudgetExceededError
 ```
 
 The FastAPI boundary then translates integration exceptions into the public API contract:
@@ -816,6 +827,9 @@ MappingError
 RateLimitError
   -> 503 Service Unavailable
   -> upstream_rate_limited
+RetryBudgetExceededError
+  -> 504 Gateway Timeout
+  -> upstream_retry_budget_exceeded
 UpstreamConnectionError
   -> 502 Bad Gateway
   -> upstream_connection_error
@@ -850,6 +864,17 @@ For example, an upstream timeout is exposed as:
 }
 ```
 
+Retry-budget exhaustion is exposed as:
+
+```json
+{
+  "code": "upstream_retry_budget_exceeded",
+  "detail": "The upstream operation exceeded its retry time budget."
+}
+```
+
+The retry-budget response does not expose the configured budget, remaining time, upstream URL, or original internal exception.
+
 Invalid provider responses and semantically invalid vendor data use:
 
 ```json
@@ -870,7 +895,7 @@ Mapping failures use:
 
 The public error contract is modeled with Pydantic through `ErrorResponse` and documented in OpenAPI for `502`, `503`, and `504` responses.
 
-Internal exception messages, Pydantic validation details, unsupported enum members, dictionary lookup failures, and other implementation details are not returned directly to API consumers.
+Internal exception messages, Pydantic validation details, unsupported enum members, dictionary lookup failures, retry-budget implementation details, and other implementation details are not returned directly to API consumers.
 
 The public error code communicates a stable failure category while implementation-specific diagnostic details remain inside the integration boundary.
 
@@ -992,6 +1017,78 @@ Transient failures alone do not make every operation safe to retry.
 
 Future mutating operations such as `POST` requests should not automatically reuse this behavior unless the provider guarantees idempotency or supports mechanisms such as idempotency keys.
 
+#### Retry scheduling budget
+
+The retry policy optionally supports a time-based retry budget in addition to `max_attempts`.
+
+`VENDOR_RETRY_BUDGET_SECONDS` is disabled by default so the existing attempt-based behavior remains backward compatible and the application does not invent an upstream latency SLA.
+
+When configured, the relative budget is converted once at the beginning of `RetryPolicy.execute()` into an absolute deadline based on the monotonic clock.
+
+The budget is intentionally a **retry-scheduling deadline**, not a strict end-to-end deadline.
+
+```text
+operation begins
+      |
+      v
+attempt executes
+      |
+      +--> success
+      |      |
+      |      v
+      |   return result
+      |
+      +--> transient failure
+             |
+             v
+      attempts remaining?
+        |          |
+       no         yes
+        |          |
+        v          v
+ propagate     calculate delay
+ last error         |
+                    v
+           does delay fit budget?
+              |            |
+             no           yes
+              |            |
+              v            v
+     RetryBudgetExceeded  sleep
+                              |
+                              v
+                    re-check deadline
+                       |          |
+                    expired     valid
+                       |          |
+                       v          v
+              RetryBudgetExceeded
+                                  retry
+```
+
+Important semantics:
+
+- The initial attempt is allowed normally.
+- Time spent inside already-started attempts contributes to the elapsed budget for future retry decisions.
+- An already-started synchronous operation is not cancelled when the deadline passes.
+- If an attempt started validly and later succeeds, its successful result is returned even if the deadline passed while it was executing.
+- Non-transient errors are propagated directly and are never replaced by `RetryBudgetExceededError`.
+- When `max_attempts` is already exhausted, the last transient upstream exception takes precedence.
+- A retry delay must be strictly smaller than the remaining budget. A delay equal to the remaining budget is rejected because no time would remain to begin the next attempt.
+- The deadline is checked again after sleeping because actual elapsed time may exceed the planned sleep duration.
+- Provider `Retry-After` values are first validated against `VENDOR_RETRY_MAX_RETRY_AFTER_SECONDS`; only accepted delays are then evaluated against the remaining retry budget.
+- `RetryBudgetExceededError` preserves the last transient failure through Python exception chaining.
+
+Because the current implementation uses synchronous blocking operations, the retry budget does not interrupt an already-running `RateLimiter.acquire()` or HTTP request. A strict shared end-to-end deadline would require propagating the remaining deadline into those lower layers.
+
+Therefore:
+
+```text
+retry scheduling deadline
+≠
+strict end-to-end deadline
+```
+
 ### Rate limiting and Retry-After
 
 HTTP `429 Too Many Requests` responses from the upstream provider are translated into `RateLimitError`.
@@ -1036,6 +1133,8 @@ Retry-After <= configured limit
         ↓
 combine with local backoff
         ↓
+evaluate against retry budget when enabled
+        ↓
 sleep
         ↓
 retry
@@ -1046,12 +1145,16 @@ while:
 ```text
 Retry-After > configured limit
         ↓
+no valid retry delay
+        ↓
 no sleep
         ↓
 no retry
         ↓
 propagate RateLimitError
 ```
+
+The maximum accepted `Retry-After` rule has priority over the retry budget. A provider-requested wait that exceeds `VENDOR_RETRY_MAX_RETRY_AFTER_SECONDS` is rejected as `RateLimitError` before budget scheduling is considered.
 
 At the FastAPI boundary, the normalized semantic delay is converted back into a standard HTTP response header when available.
 
@@ -1072,6 +1175,8 @@ retry_after_seconds = 30.2
 Rounding upward prevents downstream consumers from being instructed to retry earlier than the semantic delay represented internally.
 
 An upstream rate limit is exposed as `503 Service Unavailable`, because the limit belongs to the service-to-provider interaction rather than necessarily representing a rate limit imposed directly on the API consumer.
+
+`RetryBudgetExceededError` is exposed independently as `504 Gateway Timeout` and does not inherit or reconstruct a public `Retry-After` header from a chained `RateLimitError`.
 
 ### Client-side rate limiting
 
@@ -1336,6 +1441,18 @@ Retry coverage includes:
 - `Retry-After` precedence over local backoff.
 - Local backoff precedence when larger.
 - Excessive `Retry-After` rejection.
+- Retry-budget disabled-by-default behavior.
+- Positive retry-budget configuration and validation.
+- Retry-budget exhaustion before an invalid delay can be scheduled.
+- Equal delay/remaining-budget boundary rejection.
+- Post-sleep deadline revalidation.
+- Retry-budget exception chaining.
+- `max_attempts` precedence over budget exhaustion.
+- Non-transient error precedence over budget exhaustion.
+- Accepted `Retry-After` vs remaining-budget validation.
+- Excessive `Retry-After` policy-limit precedence over retry budget.
+- Vendor-client retry-budget collaboration.
+- Prevention of a second rate-limit acquisition when the retry budget blocks the second attempt.
 - Invalid retry configuration.
 - Vendor-client recovery after a transient failure.
 - Invalid upstream payloads are not retried.
@@ -1369,6 +1486,8 @@ The suite also covers:
 - Prevention of internal error-message leakage.
 - Public `Retry-After` integer propagation.
 - Public `Retry-After` upward rounding.
+- Retry-budget exhaustion translation to HTTP `504`.
+- Prevention of `Retry-After` propagation from retry-budget exhaustion.
 - OpenAPI documentation for `502`, `503`, and `504` responses.
 - Permanent HTTP error translation.
 - Timeout error translation.
@@ -1379,11 +1498,13 @@ The suite also covers:
 - Positive timeout validation.
 - Default retry configuration.
 - Retry-setting validation.
+- Retry-budget environment configuration and validation.
 - Rejection of empty access tokens.
 - Rejection of whitespace-only access tokens.
 - Secret-value preservation through `SecretStr`.
 - Composition-root dependency wiring.
 - Composition-root retry-policy wiring.
+- Composition-root retry-budget wiring.
 - Explicit `SecretStr` to `str` adaptation.
 - `AnyHttpUrl` to `str` adaptation.
 - Transport lifecycle cleanup.
@@ -1545,7 +1666,7 @@ The suite follows these rules:
 Current test count:
 
 ```text
-151 tests
+168 tests
 ```
 
 Run the suite with:
@@ -1715,6 +1836,8 @@ VENDOR_TIMEOUT=30
 VENDOR_RETRY_MAX_ATTEMPTS=3
 VENDOR_RETRY_BASE_DELAY=0.5
 VENDOR_RETRY_MAX_RETRY_AFTER_SECONDS=60
+# Optional: enables the retry scheduling time budget
+# VENDOR_RETRY_BUDGET_SECONDS=10
 # Optional: configure both values together to enable local rate limiting
 VENDOR_RATE_LIMIT_REQUESTS_PER_SECOND=10
 VENDOR_RATE_LIMIT_CAPACITY=20
@@ -1761,11 +1884,19 @@ VENDOR_RETRY_MAX_RETRY_AFTER_SECONDS
 → defaults to 60.0
 → maximum Retry-After delay accepted by the retry policy
 → must be greater than 0
+VENDOR_RETRY_BUDGET_SECONDS
+→ optional
+→ disabled by default
+→ must be greater than 0 when configured
+→ limits retry scheduling by time in addition to max attempts
+→ does not impose a strict end-to-end request deadline
 ```
 
 `VENDOR_RETRY_MAX_RETRY_AFTER_SECONDS` does not represent the maximum delay for every retry.
 
 It specifically represents the maximum provider-requested `Retry-After` delay that this process is willing to wait for before abandoning automatic retry.
+
+`VENDOR_RETRY_BUDGET_SECONDS` limits whether another retry can be scheduled within the remaining time budget. It does not cancel an already-running synchronous rate-limit wait or HTTP request.
 
 Real secrets must be provided through environment variables or a proper secret-management system.
 
@@ -1825,6 +1956,8 @@ The project follows several principles that will guide future changes:
 - Do not automatically apply read-operation retry behavior to future mutating operations.
 - Respect provider `Retry-After` instructions without retrying earlier than requested.
 - Avoid unbounded provider-directed waits inside the retry policy.
+- Bound retry scheduling by time only when an explicit retry budget is configured.
+- Do not treat the retry-scheduling deadline as a strict end-to-end cancellation deadline.
 - Keep proactive client-side rate limiting separate from reactive provider `429` handling.
 - Apply local rate-limit acquisition to every physical retry attempt.
 - Do not invent provider quotas when client-side rate limiting is not explicitly configured.
@@ -1959,10 +2092,18 @@ The project will evolve incrementally.
 - [x] Per-retry-attempt rate-limit acquisition.
 - [x] Deterministic rate-limit tests.
 - [x] Concurrent token-acquisition test.
+- [x] Optional retry scheduling budget.
+- [x] Monotonic retry deadline.
+- [x] Retry-budget configuration and validation.
+- [x] Retry-budget exhaustion exception chaining.
+- [x] Retry delay vs remaining-budget validation.
+- [x] Post-sleep deadline revalidation.
+- [x] Retry-After and retry-budget precedence.
+- [x] Vendor-client retry-budget collaboration tests.
+- [x] Public retry-budget exhaustion translation to HTTP 504.
 
 ### Next
 
-- [ ] Retry budget / retry deadline.
 - [ ] Idempotency-key support for safe retries of mutating operations.
 - [ ] Explicit retry semantics for future mutating operations.
 - [ ] GraphQL integration.
@@ -1979,8 +2120,8 @@ This repository is under active development and is intentionally built in small,
 
 Each phase adds a focused backend concept together with tests before moving to the next topic.
 
-The current implementation includes validated application configuration with Pydantic Settings, explicit secret handling with `SecretStr`, retry configuration through environment-backed settings, a composition root that wires and owns integration resources, composition-root injection of a configurable resilience policy, a concrete HTTPX transport with Bearer authentication and deterministic cleanup, semantic upstream exception classification, configurable transient-failure retries, exponential backoff with full jitter, normalized `Retry-After` handling, `Retry-After`-aware scheduling, bounded provider-directed retry waits, strict nested upstream schemas, lazy vendor pagination, empty-page handling, cycle detection, non-monotonic pagination support, semantic vendor-data validation, fail-fast page consistency, explicit upstream-to-public mapping, separate upstream and public enums, deterministic contract normalization, unsupported-contract mapping detection, stable mapping-error translation, a paginated `GET /vendor/items?page=N` API contract, FastAPI request-query validation, stable public integration error responses, OpenAPI documentation, isolated API tests through dependency overrides, deterministic retry tests, collaboration tests across `VendorClient` and `RetryPolicy`, optional process-local client-side rate limiting through a thread-safe token bucket, a structural `RateLimiter` contract with no-op and token-bucket implementations, per-retry-attempt capacity acquisition, deterministic monotonic-clock refill behavior, concurrent acquisition coverage, and a GitHub Actions CI pipeline that verifies formatting, linting, tests, coverage, and test reports.
+The current implementation includes validated application configuration with Pydantic Settings, explicit secret handling with `SecretStr`, retry configuration through environment-backed settings, a composition root that wires and owns integration resources, composition-root injection of a configurable resilience policy, a concrete HTTPX transport with Bearer authentication and deterministic cleanup, semantic upstream exception classification, configurable transient-failure retries, exponential backoff with full jitter, normalized `Retry-After` handling, `Retry-After`-aware scheduling, bounded provider-directed retry waits, an optional monotonic retry-scheduling budget, retry-budget exhaustion chaining, strict nested upstream schemas, lazy vendor pagination, empty-page handling, cycle detection, non-monotonic pagination support, semantic vendor-data validation, fail-fast page consistency, explicit upstream-to-public mapping, separate upstream and public enums, deterministic contract normalization, unsupported-contract mapping detection, stable mapping-error translation, a paginated `GET /vendor/items?page=N` API contract, FastAPI request-query validation, stable public integration error responses including retry-budget exhaustion as HTTP `504`, OpenAPI documentation, isolated API tests through dependency overrides, deterministic retry tests, collaboration tests across `VendorClient`, `RetryPolicy`, and `RateLimiter`, optional process-local client-side rate limiting through a thread-safe token bucket, a structural `RateLimiter` contract with no-op and token-bucket implementations, per-retry-attempt capacity acquisition, deterministic monotonic-clock refill behavior, concurrent acquisition coverage, and a GitHub Actions CI pipeline that verifies formatting, linting, tests, coverage, and test reports.
 
 Retries are currently applied only to the vendor client's read operation. The project intentionally does not assume that future mutating operations are safe to retry merely because a failure is transient. Safe retries for future `POST`, `PUT`, or `DELETE` operations will require operation-specific semantics, provider guarantees, or mechanisms such as idempotency keys.
 
-The current suite contains 151 passing tests.
+The current suite contains 168 passing tests.

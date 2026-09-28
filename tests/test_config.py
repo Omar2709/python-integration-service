@@ -20,6 +20,10 @@ def valid_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "120",
     )
     monkeypatch.delenv(
+        "VENDOR_RETRY_BUDGET_SECONDS",
+        raising=False,
+    )
+    monkeypatch.delenv(
         "VENDOR_RATE_LIMIT_REQUESTS_PER_SECOND",
         raising=False,
     )
@@ -73,6 +77,49 @@ def test_uses_default_retry_settings(
     assert settings.vendor_retry_max_attempts == 3
     assert settings.vendor_retry_base_delay == 0.5
     assert settings.vendor_retry_max_retry_after_seconds == 60.0
+
+
+def test_retry_budget_is_disabled_by_default(
+    valid_env: None,
+) -> None:
+    settings = load_settings_from_env()
+
+    assert settings.vendor_retry_budget_seconds is None
+
+
+def test_loads_retry_budget_configuration(
+    valid_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "VENDOR_RETRY_BUDGET_SECONDS",
+        "12.5",
+    )
+
+    settings = load_settings_from_env()
+
+    assert settings.vendor_retry_budget_seconds == 12.5
+
+
+@pytest.mark.parametrize(
+    "retry_budget_seconds",
+    [
+        pytest.param("0", id="zero"),
+        pytest.param("-1", id="negative"),
+    ],
+)
+def test_rejects_non_positive_retry_budget(
+    valid_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    retry_budget_seconds: str,
+) -> None:
+    monkeypatch.setenv(
+        "VENDOR_RETRY_BUDGET_SECONDS",
+        retry_budget_seconds,
+    )
+
+    with pytest.raises(ValidationError):
+        load_settings_from_env()
 
 
 def test_rate_limiting_is_disabled_by_default(

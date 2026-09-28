@@ -2,6 +2,10 @@
     "cSpell.language": "en,es",
 
     "cSpell.words": [
+        "autospec",
+        "autospecced",
+        "autospeccing",
+        "conftest",
         "contextlib",
         "contextmanager",
         "delenv",
@@ -14,6 +18,7 @@
         "HTTPX",
         "junitxml",
         "monkeypatch",
+        "monkeypatching",
         "mypy",
         "pycache",
         "pydantic",

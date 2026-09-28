@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 from python_integration_service.integrations.exceptions import (
     InvalidUpstreamResponseError,
+    RetryBudgetExceededError,
     UpstreamTimeoutError,
 )
 from python_integration_service.integrations.rate_limit import RateLimiter
@@ -149,6 +150,48 @@ def test_retry_attempts_acquire_rate_limit_capacity_independently() -> None:
 
     assert rate_limiter.acquire.call_count == 2
     assert transport.get.call_count == 2
+
+
+def test_vendor_client_does_not_start_retry_after_budget_is_exhausted() -> None:
+    transport = make_transport()
+    transport.get.side_effect = UpstreamTimeoutError("temporary timeout")
+
+    rate_limiter = make_rate_limiter()
+
+    clock = MagicMock(
+        side_effect=[
+            100.0,
+            101.5,
+        ]
+    )
+
+    retry_policy = RetryPolicy(
+        max_attempts=3,
+        base_delay=1.0,
+        max_retry_after_seconds=60.0,
+        retry_budget_seconds=2.0,
+        sleep=MagicMock(),
+        jitter=MagicMock(return_value=1.0),
+        clock=clock,
+    )
+
+    client = VendorClient(
+        base_url="https://api.vendor.test",
+        transport=transport,
+        retry_policy=retry_policy,
+        rate_limiter=rate_limiter,
+    )
+
+    with pytest.raises(RetryBudgetExceededError) as exc_info:
+        client.get("/items")
+
+    assert isinstance(
+        exc_info.value.__cause__,
+        UpstreamTimeoutError,
+    )
+
+    rate_limiter.acquire.assert_called_once_with()
+    transport.get.assert_called_once_with("https://api.vendor.test/items")
 
 
 def test_invalid_upstream_payload_is_not_retried() -> None:

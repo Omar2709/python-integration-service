@@ -20,6 +20,10 @@ class Settings(BaseSettings):
         default=60.0,
         gt=0,
     )
+    vendor_retry_budget_seconds: float | None = Field(
+        default=None,
+        gt=0,
+    )
     vendor_rate_limit_requests_per_second: float | None = Field(
         default=None,
         gt=0,

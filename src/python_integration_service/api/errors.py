@@ -10,6 +10,7 @@ from python_integration_service.integrations.exceptions import (
     InvalidUpstreamResponseError,
     MappingError,
     RateLimitError,
+    RetryBudgetExceededError,
     UpstreamConnectionError,
     UpstreamServerError,
     UpstreamTimeoutError,
@@ -74,6 +75,19 @@ async def rate_limit_error_handler(
             detail="The upstream service is temporarily rate limited.",
         ).model_dump(mode="json"),
         headers=headers,
+    )
+
+
+async def retry_budget_exceeded_error_handler(
+    request: Request,
+    exc: Exception,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+        content=ErrorResponse(
+            code="upstream_retry_budget_exceeded",
+            detail="The upstream operation exceeded its retry time budget.",
+        ).model_dump(mode="json"),
     )
 
 
@@ -158,6 +172,10 @@ def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(
         RateLimitError,
         rate_limit_error_handler,
+    )
+    app.add_exception_handler(
+        RetryBudgetExceededError,
+        retry_budget_exceeded_error_handler,
     )
     app.add_exception_handler(
         UpstreamTimeoutError,

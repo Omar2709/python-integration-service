@@ -5,6 +5,7 @@ from typing import TypeVar
 
 from python_integration_service.integrations.exceptions import (
     RateLimitError,
+    RetryBudgetExceededError,
     TransientIntegrationError,
 )
 
@@ -19,6 +20,8 @@ class RetryPolicy:
         max_retry_after_seconds: float,
         sleep: Callable[[float], None] = time.sleep,
         jitter: Callable[[float, float], float] = random.uniform,
+        retry_budget_seconds: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if max_attempts <= 0:
             raise ValueError("max_attempts must be greater than 0")
@@ -29,16 +32,23 @@ class RetryPolicy:
         if max_retry_after_seconds <= 0:
             raise ValueError("max_retry_after_seconds must be greater than 0")
 
+        if retry_budget_seconds is not None and retry_budget_seconds <= 0:
+            raise ValueError("retry_budget_seconds must be greater than 0")
+
         self._max_attempts = max_attempts
         self._base_delay = base_delay
         self._max_retry_after_seconds = max_retry_after_seconds
         self._sleep = sleep
         self._jitter = jitter
+        self._retry_budget_seconds = retry_budget_seconds
+        self._clock = clock
 
     def execute(
         self,
         operation: Callable[[], T],
     ) -> T:
+        deadline = self._create_deadline()
+
         for attempt in range(1, self._max_attempts + 1):
             try:
                 return operation()
@@ -55,9 +65,57 @@ class RetryPolicy:
                 if delay is None:
                     raise
 
+                self._ensure_retry_can_be_scheduled(
+                    deadline=deadline,
+                    delay=delay,
+                    cause=exc,
+                )
+
                 self._sleep(delay)
 
+                self._ensure_deadline_has_not_expired(
+                    deadline=deadline,
+                    cause=exc,
+                )
+
         raise RuntimeError("Retry policy reached an unreachable state")
+
+    def _create_deadline(self) -> float | None:
+        if self._retry_budget_seconds is None:
+            return None
+
+        return self._clock() + self._retry_budget_seconds
+
+    def _ensure_retry_can_be_scheduled(
+        self,
+        *,
+        deadline: float | None,
+        delay: float,
+        cause: TransientIntegrationError,
+    ) -> None:
+        if deadline is None:
+            return
+
+        remaining = deadline - self._clock()
+
+        if remaining <= 0 or delay >= remaining:
+            raise RetryBudgetExceededError(
+                "Retry budget exhausted before another attempt could be scheduled"
+            ) from cause
+
+    def _ensure_deadline_has_not_expired(
+        self,
+        *,
+        deadline: float | None,
+        cause: TransientIntegrationError,
+    ) -> None:
+        if deadline is None:
+            return
+
+        if self._clock() >= deadline:
+            raise RetryBudgetExceededError(
+                "Retry budget exhausted before another attempt could start"
+            ) from cause
 
     def _calculate_delay(
         self,

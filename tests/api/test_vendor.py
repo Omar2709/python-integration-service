@@ -14,6 +14,7 @@ from python_integration_service.integrations.exceptions import (
     InvalidUpstreamResponseError,
     MappingError,
     RateLimitError,
+    RetryBudgetExceededError,
     UpstreamConnectionError,
     UpstreamServerError,
     UpstreamTimeoutError,
@@ -207,6 +208,12 @@ def test_get_vendor_items_rejects_invalid_page_query(
             "The upstream service is temporarily rate limited.",
         ),
         (
+            RetryBudgetExceededError("internal retry budget exhausted"),
+            status.HTTP_504_GATEWAY_TIMEOUT,
+            "upstream_retry_budget_exceeded",
+            "The upstream operation exceeded its retry time budget.",
+        ),
+        (
             UpstreamTimeoutError(
                 "request timed out while calling internal upstream URL"
             ),
@@ -320,6 +327,25 @@ def test_rate_limit_error_omits_missing_retry_after(
     response = client.get("/vendor/items")
 
     assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+    assert "Retry-After" not in response.headers
+
+
+def test_retry_budget_error_does_not_expose_retry_after(
+    client: TestClient,
+    vendor_client: NonCallableMagicMock,
+) -> None:
+    cause = RateLimitError(
+        "provider rate limit exceeded",
+        retry_after_seconds=30.0,
+    )
+    error = RetryBudgetExceededError("internal retry budget exhausted")
+    error.__cause__ = cause
+
+    vendor_client.get_items_page.side_effect = error
+
+    response = client.get("/vendor/items")
+
+    assert response.status_code == status.HTTP_504_GATEWAY_TIMEOUT
     assert "Retry-After" not in response.headers
 
 

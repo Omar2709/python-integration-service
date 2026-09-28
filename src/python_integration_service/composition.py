@@ -31,6 +31,7 @@ def create_vendor_client(settings: Settings) -> Iterator[VendorClient]:
         max_attempts=settings.vendor_retry_max_attempts,
         base_delay=settings.vendor_retry_base_delay,
         max_retry_after_seconds=settings.vendor_retry_max_retry_after_seconds,
+        retry_budget_seconds=settings.vendor_retry_budget_seconds,
     )
 
     rate_limiter = create_rate_limiter(settings)
