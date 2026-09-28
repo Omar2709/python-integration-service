@@ -27,6 +27,7 @@
         "pytest",
         "setenv",
         "Starlette",
+        "Uncopyable",
         "uvicorn",
         "Uvicorn",
         "venv"

@@ -12,15 +12,25 @@ from python_integration_service.integrations.exceptions import (
 T = TypeVar("T")
 
 
+def _retry_all_transient(
+    error: TransientIntegrationError,
+) -> bool:
+    return True
+
+
 class RetryPolicy:
     def __init__(
         self,
         max_attempts: int,
         base_delay: float,
         max_retry_after_seconds: float,
+        retry_budget_seconds: float | None = None,
+        retry_if: Callable[
+            [TransientIntegrationError],
+            bool,
+        ] = _retry_all_transient,
         sleep: Callable[[float], None] = time.sleep,
         jitter: Callable[[float, float], float] = random.uniform,
-        retry_budget_seconds: float | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if max_attempts <= 0:
@@ -38,9 +48,10 @@ class RetryPolicy:
         self._max_attempts = max_attempts
         self._base_delay = base_delay
         self._max_retry_after_seconds = max_retry_after_seconds
+        self._retry_budget_seconds = retry_budget_seconds
+        self._retry_if = retry_if
         self._sleep = sleep
         self._jitter = jitter
-        self._retry_budget_seconds = retry_budget_seconds
         self._clock = clock
 
     def execute(
@@ -55,6 +66,14 @@ class RetryPolicy:
 
             except TransientIntegrationError as exc:
                 if attempt == self._max_attempts:
+                    raise
+
+                retry_decision = self._retry_if(exc)
+
+                if not isinstance(retry_decision, bool):
+                    raise TypeError("retry_if must return a bool")
+
+                if not retry_decision:
                     raise
 
                 delay = self._calculate_delay(

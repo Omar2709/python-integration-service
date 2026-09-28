@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime
 
 import httpx
@@ -40,6 +41,92 @@ def test_get_returns_json_response() -> None:
         "id": 123,
         "name": "Alice",
     }
+
+
+def test_post_sends_json_payload_and_request_headers() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.headers["Authorization"] == "Bearer test-token"
+        assert request.headers["Accept"] == "application/json"
+        assert request.headers["Idempotency-Key"] == "operation-123"
+        assert json.loads(request.content) == {
+            "name": "Item A",
+            "quantity": 2,
+        }
+
+        return httpx.Response(
+            201,
+            json={"id": 123},
+        )
+
+    with HttpxTransport(
+        access_token="test-token",
+        timeout=10.0,
+        transport=httpx.MockTransport(handler),
+    ) as transport:
+        result = transport.post(
+            "https://api.vendor.test/items",
+            {
+                "name": "Item A",
+                "quantity": 2,
+            },
+            headers={
+                "Idempotency-Key": "operation-123",
+            },
+        )
+
+    assert result == {"id": 123}
+
+
+def test_post_rejects_non_json_serializable_payload_before_io() -> None:
+    request_was_sent = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_was_sent
+        request_was_sent = True
+        return httpx.Response(200, json={})
+
+    with (
+        HttpxTransport(
+            access_token="test-token",
+            timeout=10.0,
+            transport=httpx.MockTransport(handler),
+        ) as transport,
+        pytest.raises(
+            ValueError,
+            match="Request payload must be JSON serializable",
+        ) as exc_info,
+    ):
+        transport.post(
+            "https://api.vendor.test/items",
+            {
+                "invalid": object(),
+            },
+        )
+
+    assert isinstance(exc_info.value.__cause__, TypeError)
+    assert request_was_sent is False
+
+
+def test_post_uses_shared_http_error_translation() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            503,
+            json={"detail": "unavailable"},
+        )
+
+    with (
+        HttpxTransport(
+            access_token="test-token",
+            timeout=10.0,
+            transport=httpx.MockTransport(handler),
+        ) as transport,
+        pytest.raises(UpstreamUnavailableError),
+    ):
+        transport.post(
+            "https://api.vendor.test/items",
+            {"name": "Item A"},
+        )
 
 
 def test_401_raises_authentication_error_with_http_status_cause() -> None:

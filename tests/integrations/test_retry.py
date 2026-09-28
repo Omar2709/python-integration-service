@@ -130,6 +130,128 @@ def test_retry_policy_propagates_after_max_attempts() -> None:
     assert jitter.call_count == 2
 
 
+def test_retry_policy_does_not_retry_when_predicate_rejects_error() -> None:
+    error = UpstreamTimeoutError("timeout")
+    operation = MagicMock(side_effect=error)
+    retry_if = MagicMock(return_value=False)
+    sleep = MagicMock()
+    jitter = MagicMock()
+
+    policy = RetryPolicy(
+        max_attempts=3,
+        base_delay=1.0,
+        max_retry_after_seconds=60.0,
+        retry_if=retry_if,
+        sleep=sleep,
+        jitter=jitter,
+    )
+
+    with pytest.raises(UpstreamTimeoutError) as exc_info:
+        policy.execute(operation)
+
+    assert exc_info.value is error
+    operation.assert_called_once_with()
+    retry_if.assert_called_once_with(error)
+    jitter.assert_not_called()
+    sleep.assert_not_called()
+
+
+def test_retry_policy_retries_when_predicate_accepts_error() -> None:
+    error = UpstreamTimeoutError("timeout")
+    operation = MagicMock(
+        side_effect=[
+            error,
+            "ok",
+        ]
+    )
+    retry_if = MagicMock(return_value=True)
+    sleep = MagicMock()
+    jitter = MagicMock(return_value=0.25)
+
+    policy = RetryPolicy(
+        max_attempts=3,
+        base_delay=1.0,
+        max_retry_after_seconds=60.0,
+        retry_if=retry_if,
+        sleep=sleep,
+        jitter=jitter,
+    )
+
+    result = policy.execute(operation)
+
+    assert result == "ok"
+    retry_if.assert_called_once_with(error)
+    sleep.assert_called_once_with(0.25)
+
+
+def test_retry_policy_does_not_evaluate_predicate_after_max_attempts() -> None:
+    error = UpstreamTimeoutError("timeout")
+    operation = MagicMock(side_effect=error)
+    retry_if = MagicMock(return_value=True)
+
+    policy = RetryPolicy(
+        max_attempts=1,
+        base_delay=1.0,
+        max_retry_after_seconds=60.0,
+        retry_if=retry_if,
+    )
+
+    with pytest.raises(UpstreamTimeoutError) as exc_info:
+        policy.execute(operation)
+
+    assert exc_info.value is error
+    retry_if.assert_not_called()
+
+
+def test_retry_policy_propagates_predicate_exception() -> None:
+    operation = MagicMock(side_effect=UpstreamTimeoutError("timeout"))
+    retry_if = MagicMock(side_effect=RuntimeError("policy bug"))
+
+    policy = RetryPolicy(
+        max_attempts=3,
+        base_delay=1.0,
+        max_retry_after_seconds=60.0,
+        retry_if=retry_if,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="policy bug",
+    ):
+        policy.execute(operation)
+
+    assert operation.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "invalid_decision",
+    [
+        pytest.param("yes", id="string"),
+        pytest.param(1, id="integer"),
+        pytest.param(None, id="none"),
+    ],
+)
+def test_retry_policy_rejects_non_boolean_predicate_result(
+    invalid_decision: object,
+) -> None:
+    operation = MagicMock(side_effect=UpstreamTimeoutError("timeout"))
+
+    policy = RetryPolicy(
+        max_attempts=3,
+        base_delay=1.0,
+        max_retry_after_seconds=60.0,
+        retry_if=MagicMock(return_value=invalid_decision),
+    )
+
+    with pytest.raises(
+        TypeError,
+        match="retry_if must return a bool",
+    ):
+        policy.execute(operation)
+
+    operation.assert_called_once_with()
+
+
 def test_retry_policy_respects_larger_retry_after() -> None:
     operation = MagicMock(
         side_effect=[

@@ -194,6 +194,221 @@ def test_vendor_client_does_not_start_retry_after_budget_is_exhausted() -> None:
     transport.get.assert_called_once_with("https://api.vendor.test/items")
 
 
+def test_post_preserves_caller_provided_idempotency_key() -> None:
+    transport = make_transport()
+    transport.post.return_value = {"id": 1}
+
+    retry_policy = make_retry_policy()
+    rate_limiter = make_rate_limiter()
+    key_factory = MagicMock()
+
+    client = VendorClient(
+        base_url="https://api.vendor.test",
+        transport=transport,
+        retry_policy=retry_policy,
+        rate_limiter=rate_limiter,
+        idempotency_key_factory=key_factory,
+    )
+
+    result = client.post(
+        "/items",
+        {"name": "Item A"},
+        idempotency_key=" operation-123 ",
+    )
+
+    assert result == {"id": 1}
+
+    key_factory.assert_not_called()
+    retry_policy.execute.assert_not_called()
+    rate_limiter.acquire.assert_called_once_with()
+    transport.post.assert_called_once_with(
+        "https://api.vendor.test/items",
+        {"name": "Item A"},
+        headers={
+            "Idempotency-Key": " operation-123 ",
+        },
+    )
+
+
+def test_post_generates_idempotency_key_when_missing() -> None:
+    transport = make_transport()
+    transport.post.return_value = {"id": 1}
+
+    key_factory = MagicMock(return_value="generated-key-123")
+
+    client = VendorClient(
+        base_url="https://api.vendor.test",
+        transport=transport,
+        retry_policy=make_retry_policy(),
+        rate_limiter=make_rate_limiter(),
+        idempotency_key_factory=key_factory,
+    )
+
+    client.post(
+        "/items",
+        {"name": "Item A"},
+    )
+
+    key_factory.assert_called_once_with()
+    assert transport.post.call_args.kwargs["headers"] == {
+        "Idempotency-Key": "generated-key-123",
+    }
+
+
+@pytest.mark.parametrize(
+    "idempotency_key",
+    [
+        pytest.param("", id="empty"),
+        pytest.param("   ", id="whitespace"),
+        pytest.param("bad\nkey", id="newline"),
+        pytest.param("bad\rkey", id="carriage-return"),
+        pytest.param("bad\tkey", id="tab"),
+    ],
+)
+def test_post_rejects_invalid_caller_idempotency_key(
+    idempotency_key: str,
+) -> None:
+    transport = make_transport()
+    rate_limiter = make_rate_limiter()
+    retry_policy = make_retry_policy()
+
+    client = VendorClient(
+        base_url="https://api.vendor.test",
+        transport=transport,
+        retry_policy=retry_policy,
+        rate_limiter=rate_limiter,
+    )
+
+    with pytest.raises(ValueError):
+        client.post(
+            "/items",
+            {"name": "Item A"},
+            idempotency_key=idempotency_key,
+        )
+
+    rate_limiter.acquire.assert_not_called()
+    transport.post.assert_not_called()
+    retry_policy.execute.assert_not_called()
+
+
+def test_post_validates_generated_idempotency_key() -> None:
+    transport = make_transport()
+    rate_limiter = make_rate_limiter()
+
+    client = VendorClient(
+        base_url="https://api.vendor.test",
+        transport=transport,
+        retry_policy=make_retry_policy(),
+        rate_limiter=rate_limiter,
+        idempotency_key_factory=MagicMock(return_value="bad\nkey"),
+    )
+
+    with pytest.raises(ValueError):
+        client.post(
+            "/items",
+            {"name": "Item A"},
+        )
+
+    rate_limiter.acquire.assert_not_called()
+    transport.post.assert_not_called()
+
+
+def test_post_uses_deep_payload_snapshot() -> None:
+    transport = make_transport()
+    transport.post.return_value = {"id": 1}
+
+    payload = {
+        "metadata": {
+            "tags": ["initial"],
+        },
+    }
+
+    client = VendorClient(
+        base_url="https://api.vendor.test",
+        transport=transport,
+        retry_policy=make_retry_policy(),
+        rate_limiter=make_rate_limiter(),
+        idempotency_key_factory=MagicMock(return_value="key-123"),
+    )
+
+    client.post("/items", payload)
+
+    sent_payload = transport.post.call_args.args[1]
+
+    payload["metadata"]["tags"].append("changed")
+
+    assert sent_payload == {
+        "metadata": {
+            "tags": ["initial"],
+        },
+    }
+
+
+def test_post_fails_before_io_when_payload_cannot_be_copied() -> None:
+    class Uncopyable:
+        def __deepcopy__(self, memo: dict) -> object:
+            raise RuntimeError("cannot copy")
+
+    transport = make_transport()
+    rate_limiter = make_rate_limiter()
+    retry_policy = make_retry_policy()
+
+    client = VendorClient(
+        base_url="https://api.vendor.test",
+        transport=transport,
+        retry_policy=retry_policy,
+        rate_limiter=rate_limiter,
+        idempotency_key_factory=MagicMock(return_value="key-123"),
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        client.post(
+            "/items",
+            {
+                "value": Uncopyable(),
+            },
+        )
+
+    assert isinstance(
+        exc_info.value.__cause__,
+        RuntimeError,
+    )
+
+    rate_limiter.acquire.assert_not_called()
+    transport.post.assert_not_called()
+    retry_policy.execute.assert_not_called()
+
+
+def test_post_does_not_retry_transient_failure() -> None:
+    error = UpstreamTimeoutError("temporary timeout")
+
+    transport = make_transport()
+    transport.post.side_effect = error
+
+    retry_policy = make_retry_policy()
+    rate_limiter = make_rate_limiter()
+
+    client = VendorClient(
+        base_url="https://api.vendor.test",
+        transport=transport,
+        retry_policy=retry_policy,
+        rate_limiter=rate_limiter,
+        idempotency_key_factory=MagicMock(return_value="key-123"),
+    )
+
+    with pytest.raises(UpstreamTimeoutError) as exc_info:
+        client.post(
+            "/items",
+            {"name": "Item A"},
+        )
+
+    assert exc_info.value is error
+
+    rate_limiter.acquire.assert_called_once_with()
+    transport.post.assert_called_once()
+    retry_policy.execute.assert_not_called()
+
+
 def test_invalid_upstream_payload_is_not_retried() -> None:
     transport = make_transport()
     transport.get.return_value = make_items_page_payload(

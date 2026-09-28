@@ -258,6 +258,14 @@ This allows higher-level application code to distinguish integration-specific fa
 
 `Transport` defines an abstraction for outbound communication.
 
+Its current public contract is intentionally explicit:
+
+```text
+Transport
+├── get(url)
+└── post(url, payload, headers)
+```
+
 `VendorClient` depends on this abstraction instead of depending directly on a concrete HTTP library.
 
 Conceptually:
@@ -271,6 +279,26 @@ Transport
     +-- FakeTransport
     +-- HttpxTransport
 ```
+
+`post()` accepts a request payload plus optional per-request headers. This allows provider-specific semantics such as idempotency headers to be prepared by `VendorClient` without teaching the transport what those headers mean.
+
+The transport owns communication mechanics, while `VendorClient` owns provider-specific request semantics.
+
+`HttpxTransport` intentionally keeps `get()` and `post()` as explicit public operations rather than exposing a generic public `request(method, ...)` API.
+
+Internally, both methods reuse a private `_request()` method so GET and POST share one HTTP/HTTPX execution and error-translation policy:
+
+```text
+HttpxTransport.get()
+        |
+        v
+   _request()
+        ^
+        |
+HttpxTransport.post()
+```
+
+This keeps the public transport contract small and explicit while avoiding duplicated HTTP translation behavior.
 
 This follows the Dependency Inversion Principle and makes the integration client easier to test while allowing the concrete HTTP implementation to be replaced independently.
 
@@ -420,6 +448,11 @@ The project includes a concrete HTTP transport implemented with `httpx.Client`.
 
 Current behavior includes:
 
+- Explicit `GET` support.
+- Explicit `POST` support.
+- JSON request payload transmission for POST.
+- Per-request HTTP headers.
+- Shared HTTP execution through the private `_request()` method.
 - Outbound requests through `httpx.Client`.
 - Bearer authentication headers.
 - Configurable request timeouts.
@@ -435,12 +468,29 @@ Current behavior includes:
 - HTTP `504` handling as `UpstreamTimeoutError`.
 - HTTP-specific `Retry-After` parsing.
 - Normalization of valid `Retry-After` values into seconds.
+- Pre-I/O JSON serialization validation for POST payloads.
 
-This keeps protocol-specific concerns isolated from higher-level application logic.
+Before a POST request is sent, the transport verifies that the payload is JSON serializable.
+
+A serialization failure is treated as a local request-preparation error:
+
+```text
+JSON serialization failure
+        ↓
+TypeError from JSON encoder
+        ↓
+ValueError
+```
+
+The original `TypeError` is preserved through exception chaining.
+
+This failure is intentionally not translated into `IntegrationError`, because it does not represent a network, HTTP, or provider failure.
+
+This keeps protocol-specific concerns isolated from higher-level application logic while preserving the distinction between local preparation failures and genuine upstream integration failures.
 
 ### Vendor client
 
-`VendorClient` is responsible for provider-specific request composition, retry delegation for safe read operations, response validation, and pagination behavior.
+`VendorClient` is responsible for provider-specific request composition, retry delegation for safe read operations, idempotency-key preparation for mutating requests, response validation, and pagination behavior.
 
 Current responsibilities include:
 
@@ -449,6 +499,11 @@ Current responsibilities include:
 - Delegation of outbound read requests through `RetryPolicy`.
 - Per-attempt rate-limit acquisition through the injected `RateLimiter`.
 - Delegation of actual outbound I/O to a `Transport`.
+- Generic POST request preparation.
+- Caller-provided idempotency-key support.
+- Internal idempotency-key generation.
+- Shared idempotency-key validation.
+- Stable deep snapshots of POST payloads.
 - Fetching individual vendor pages through `get_items_page()`.
 - Lazy multi-page traversal through `iter_items()`.
 - Validation of caller-provided page arguments.
@@ -466,36 +521,130 @@ VendorClient
 ├── rate_limiter
 ├── build_url()
 ├── get()
+├── post()
 ├── get_items_page()
 ├── iter_items()
 └── Transport
 ```
 
-The current retry boundary is intentionally narrow:
+Read and generic POST operations intentionally have different resilience behavior.
+
+For reads:
 
 ```text
-VendorClient.get()
+GET
     ↓
-RetryPolicy.execute()
-    ↓ each attempt
+RetryPolicy
+    ↓ each physical attempt
 RateLimiter.acquire()
     ↓
 Transport.get()
 ```
 
-Payload validation happens after the retry-protected transport call.
+For generic POST operations:
+
+```text
+POST
+    ↓
+resolve / validate idempotency key
+    ↓
+deep snapshot payload
+    ↓
+RateLimiter.acquire()
+    ↓
+Transport.post()
+```
+
+Generic POST does not currently invoke `RetryPolicy`.
+
+Therefore:
+
+```text
+POST + Idempotency-Key
+does not imply automatic retry.
+```
+
+An idempotency key is an important mechanism for making some mutating operations safely replayable, but the presence of a key alone does not prove that an operation is safe to retry.
+
+Replay safety depends on the documented semantics of the specific provider operation. The project therefore does not currently claim that every POST request with an idempotency key may be retried.
+
+Payload validation for read operations happens after the retry-protected transport call.
 
 Therefore:
 
 ```text
 transient transport failure
 → retry may occur
+
 successful HTTP response with invalid payload
 → InvalidUpstreamResponseError
 → no retry
 ```
 
 This keeps the client focused on provider-specific behavior while preserving a clear resilience boundary.
+
+#### Idempotency-key behavior
+
+Callers may provide an idempotency key explicitly. If the caller omits the key, `VendorClient` generates one for that logical invocation.
+
+The following rules apply:
+
+- Callers may provide an idempotency key explicitly.
+- If omitted, `VendorClient` generates one for that logical invocation.
+- The same validation applies regardless of key origin.
+- Empty keys are rejected.
+- Whitespace-only keys are rejected.
+- Keys containing control characters are rejected.
+- Caller-provided keys are preserved exactly and are not silently normalized.
+- Internally generated keys are scoped to a single `VendorClient` invocation.
+- Higher layers that need cross-invocation replay must own and reuse the idempotency key explicitly.
+- `VendorClient` remains stateless across invocations.
+
+The ownership model is therefore:
+
+```text
+single VendorClient invocation
+→ internal generation is sufficient
+
+same logical operation replayed across multiple VendorClient invocations
+→ caller owns and reuses the key
+```
+
+`VendorClient` does not maintain an in-memory mapping between keys and previous requests.
+
+Such local state would not provide a reliable global invariant across process restarts, multiple workers, or horizontally scaled application instances.
+
+#### Stable logical-operation inputs
+
+For a retry-safe mutating operation, stable identity requires more than a stable key.
+
+Conceptually:
+
+```text
+same logical operation
+=
+stable idempotency key
++
+stable request payload
+```
+
+`VendorClient` therefore creates a deep snapshot of the POST payload before outbound I/O.
+
+This prevents mutations to nested caller-owned objects after request preparation from changing the logical request representation held by the client.
+
+If the payload cannot be safely copied:
+
+```text
+deepcopy failure
+        ↓
+ValueError
+        ↓
+original exception preserved as cause
+```
+
+No upstream error type is introduced because the failure occurred during local request preparation.
+
+The current generic POST path still performs only one physical request. The stable key and payload infrastructure prepares the integration for future operation-specific retry semantics without claiming that such semantics currently exist.
 
 ### Vendor pagination
 
@@ -809,6 +958,27 @@ Retry scheduling time budget exhausted
   -> RetryBudgetExceededError
 ```
 
+Local request-preparation failures intentionally remain outside this hierarchy.
+
+For example:
+
+```text
+payload deepcopy failure
+→ ValueError from original exception
+
+JSON serialization failure
+→ ValueError from TypeError
+```
+
+By contrast:
+
+```text
+network / HTTP / provider failure
+→ IntegrationError hierarchy
+```
+
+This distinction prevents caller-side or local request-construction bugs from being misclassified as provider failures.
+
 The FastAPI boundary then translates integration exceptions into the public API contract:
 
 ```text
@@ -947,7 +1117,82 @@ retry or propagate
 
 `HttpxTransport` translates protocol-specific failures into semantic exceptions, while `RetryPolicy` owns resilience behavior.
 
-By default, the policy retries `TransientIntegrationError` subclasses:
+The policy distinguishes two separate concepts:
+
+```text
+transient failure classification
+≠
+operation-specific retry eligibility
+```
+
+`TransientIntegrationError` classifies a failure as potentially temporary.
+
+Whether another physical request may actually be scheduled is a separate policy decision.
+
+`RetryPolicy` supports an explicit predicate:
+
+```python
+retry_if: Callable[[TransientIntegrationError], bool]
+```
+
+The default predicate accepts every `TransientIntegrationError`, preserving the existing behavior for safe read operations.
+
+Conceptually:
+
+```text
+TransientIntegrationError
+        ↓
+attempts remaining?
+        ↓
+retry_if(error)?
+        ↓
+calculate backoff / Retry-After
+        ↓
+retry budget
+        ↓
+sleep
+        ↓
+retry
+```
+
+The order is intentional.
+
+If `max_attempts` is already exhausted, the predicate is not evaluated because no future retry can exist.
+
+If `retry_if(error)` returns `False`:
+
+```text
+original transient exception
+→ propagated immediately
+
+no jitter
+no backoff calculation
+no retry-budget evaluation
+no sleep
+no additional attempt
+```
+
+The predicate must return an actual boolean.
+
+A non-boolean result such as:
+
+```text
+"yes"
+1
+None
+```
+
+raises:
+
+```text
+TypeError: retry_if must return a bool
+```
+
+The implementation does not use general truthiness for retry eligibility.
+
+If the predicate itself raises an exception, that exception propagates unchanged. It is not translated into `IntegrationError`, because the predicate is local policy code rather than provider behavior.
+
+By default, the policy keeps these transient failures retry-eligible:
 
 ```text
 TransientIntegrationError
@@ -959,6 +1204,10 @@ TransientIntegrationError
 ```
 
 Permanent failures such as authentication errors, configuration errors, and invalid upstream payloads are not retried automatically.
+
+Future retry-safe mutations may inject a stricter `retry_if` predicate based on the documented contract of the specific provider operation.
+
+The shared retry engine can therefore remain responsible for attempts, backoff, jitter, `Retry-After`, and retry budgets while operation-specific policy controls eligibility.
 
 `max_attempts` represents the total number of executions, including the initial call.
 
@@ -997,9 +1246,9 @@ attempt 3 failure
 
 The final failed attempt is propagated immediately without an additional sleep.
 
-Injectable `sleep` and jitter functions keep retry tests deterministic and avoid real waiting during the test suite.
+Injectable `sleep`, jitter, clock, and retry-eligibility functions keep retry tests deterministic and avoid real waiting during the test suite.
 
-Retries are currently applied to the vendor client's read operation:
+Retries are currently applied automatically to the vendor client's read operation:
 
 ```text
 VendorClient.get()
@@ -1011,11 +1260,13 @@ RateLimiter.acquire()
 Transport.get()
 ```
 
+Generic POST operations intentionally do not use `RetryPolicy` yet.
+
 Retry eligibility depends on both the failure category and the operation semantics.
 
 Transient failures alone do not make every operation safe to retry.
 
-Future mutating operations such as `POST` requests should not automatically reuse this behavior unless the provider guarantees idempotency or supports mechanisms such as idempotency keys.
+Future mutating operations should only use retry behavior when the provider explicitly guarantees safe replay semantics for a stable idempotency key and stable payload.
 
 #### Retry scheduling budget
 
@@ -1046,10 +1297,16 @@ attempt executes
        no         yes
         |          |
         v          v
- propagate     calculate delay
- last error         |
-                    v
-           does delay fit budget?
+ propagate      retry_if?
+ last error      |    |
+                no   yes
+                 |    |
+                 v    v
+             propagate
+                    calculate delay
+                         |
+                         v
+                does delay fit budget?
               |            |
              no           yes
               |            |
@@ -1074,6 +1331,8 @@ Important semantics:
 - If an attempt started validly and later succeeds, its successful result is returned even if the deadline passed while it was executing.
 - Non-transient errors are propagated directly and are never replaced by `RetryBudgetExceededError`.
 - When `max_attempts` is already exhausted, the last transient upstream exception takes precedence.
+- `retry_if` is evaluated only when another attempt is possible.
+- A predicate rejection propagates the original transient failure without entering retry scheduling.
 - A retry delay must be strictly smaller than the remaining budget. A delay equal to the remaining budget is rejected because no time would remain to begin the next attempt.
 - The deadline is checked again after sleeping because actual elapsed time may exceed the planned sleep duration.
 - Provider `Retry-After` values are first validated against `VENDOR_RETRY_MAX_RETRY_AFTER_SECONDS`; only accepted delays are then evaluated against the remaining retry budget.
@@ -1425,7 +1684,7 @@ These examples illustrate how context managers provide deterministic resource cl
 
 ## Tests
 
-The current test suite covers application behavior, integration boundaries, resilience behavior, configuration, pagination, lifecycle management, and published API contracts.
+The current test suite covers application behavior, integration boundaries, resilience behavior, configuration, pagination, lifecycle management, POST request preparation, idempotency-key behavior, and published API contracts.
 
 ### Retry coverage
 
@@ -1453,9 +1712,39 @@ Retry coverage includes:
 - Excessive `Retry-After` policy-limit precedence over retry budget.
 - Vendor-client retry-budget collaboration.
 - Prevention of a second rate-limit acquisition when the retry budget blocks the second attempt.
+- Default retry eligibility for all `TransientIntegrationError` instances.
+- Predicate-approved retry execution.
+- Immediate propagation when the retry predicate rejects a failure.
+- `max_attempts` evaluation before retry eligibility.
+- Propagation of exceptions raised by the retry predicate.
+- Rejection of non-boolean predicate results.
+- Prevention of jitter, backoff, budget evaluation, and sleep after predicate rejection.
 - Invalid retry configuration.
 - Vendor-client recovery after a transient failure.
 - Invalid upstream payloads are not retried.
+
+### POST and idempotency coverage
+
+POST and idempotency-key coverage includes:
+
+- Generic POST transport support.
+- JSON POST payload transmission.
+- Per-request HTTP headers.
+- Shared GET/POST HTTP error translation.
+- Rejection of non-JSON-serializable payloads before provider I/O.
+- Preservation of JSON serialization `TypeError` as the cause of `ValueError`.
+- Caller-provided idempotency-key preservation.
+- Internal idempotency-key generation.
+- Shared validation for caller-provided and generated keys.
+- Rejection of empty idempotency keys.
+- Rejection of whitespace-only idempotency keys.
+- Rejection of control characters in idempotency keys.
+- Preservation of caller-provided key contents without silent normalization.
+- Deep payload snapshots.
+- Snapshot failure before provider I/O.
+- Preservation of snapshot failures through exception chaining.
+- Rate-limit acquisition for the physical POST request.
+- Explicit verification that generic POST does not use automatic retry after a transient failure.
 
 ### Additional coverage
 
@@ -1637,7 +1926,7 @@ create_autospec(..., instance=True, spec_set=True)
 
 This protects tests against interface drift by validating available attributes and method signatures.
 
-Simple callbacks such as injected sleep or jitter functions continue to use lightweight mocks when stricter autospeccing would not add meaningful value.
+Simple callbacks such as injected sleep, jitter, clock, or retry-eligibility functions continue to use lightweight mocks when stricter autospeccing would not add meaningful value.
 
 #### Parametrization
 
@@ -1649,6 +1938,7 @@ Examples include:
 - Blank-name variants.
 - Invalid pagination values.
 - Integration-error HTTP mappings.
+- Invalid retry-predicate return values.
 
 Readable parameter IDs are used where they improve CI failure diagnostics.
 
@@ -1666,7 +1956,7 @@ The suite follows these rules:
 Current test count:
 
 ```text
-168 tests
+189 tests
 ```
 
 Run the suite with:
@@ -2101,10 +2391,18 @@ The project will evolve incrementally.
 - [x] Retry-After and retry-budget precedence.
 - [x] Vendor-client retry-budget collaboration tests.
 - [x] Public retry-budget exhaustion translation to HTTP 504.
+- [x] Idempotency-key infrastructure for mutating operations.
+- [x] Generic POST transport support.
+- [x] Per-request HTTP headers.
+- [x] Caller-provided and generated idempotency keys.
+- [x] Idempotency-key validation.
+- [x] Stable payload snapshots for mutating requests.
+- [x] Local request-preparation error classification.
+- [x] Explicit retry-eligibility predicate support.
+- [x] Backward-compatible transient retry eligibility.
 
 ### Next
 
-- [ ] Idempotency-key support for safe retries of mutating operations.
 - [ ] Explicit retry semantics for future mutating operations.
 - [ ] GraphQL integration.
 - [ ] gRPC integration.
@@ -2120,8 +2418,34 @@ This repository is under active development and is intentionally built in small,
 
 Each phase adds a focused backend concept together with tests before moving to the next topic.
 
-The current implementation includes validated application configuration with Pydantic Settings, explicit secret handling with `SecretStr`, retry configuration through environment-backed settings, a composition root that wires and owns integration resources, composition-root injection of a configurable resilience policy, a concrete HTTPX transport with Bearer authentication and deterministic cleanup, semantic upstream exception classification, configurable transient-failure retries, exponential backoff with full jitter, normalized `Retry-After` handling, `Retry-After`-aware scheduling, bounded provider-directed retry waits, an optional monotonic retry-scheduling budget, retry-budget exhaustion chaining, strict nested upstream schemas, lazy vendor pagination, empty-page handling, cycle detection, non-monotonic pagination support, semantic vendor-data validation, fail-fast page consistency, explicit upstream-to-public mapping, separate upstream and public enums, deterministic contract normalization, unsupported-contract mapping detection, stable mapping-error translation, a paginated `GET /vendor/items?page=N` API contract, FastAPI request-query validation, stable public integration error responses including retry-budget exhaustion as HTTP `504`, OpenAPI documentation, isolated API tests through dependency overrides, deterministic retry tests, collaboration tests across `VendorClient`, `RetryPolicy`, and `RateLimiter`, optional process-local client-side rate limiting through a thread-safe token bucket, a structural `RateLimiter` contract with no-op and token-bucket implementations, per-retry-attempt capacity acquisition, deterministic monotonic-clock refill behavior, concurrent acquisition coverage, and a GitHub Actions CI pipeline that verifies formatting, linting, tests, coverage, and test reports.
+The current implementation includes validated application configuration with Pydantic Settings, explicit secret handling with `SecretStr`, retry configuration through environment-backed settings, a composition root that wires and owns integration resources, composition-root injection of a configurable resilience policy, a concrete HTTPX transport with Bearer authentication and deterministic cleanup, explicit GET and POST transport primitives, per-request HTTP headers, shared HTTP translation through a private `_request()` implementation, semantic upstream exception classification, configurable transient-failure retries, operation-specific retry eligibility through an injectable predicate, exponential backoff with full jitter, normalized `Retry-After` handling, `Retry-After`-aware scheduling, bounded provider-directed retry waits, an optional monotonic retry-scheduling budget, retry-budget exhaustion chaining, generic POST request preparation with caller-provided or internally generated idempotency keys, shared idempotency-key validation, stable deep payload snapshots, explicit separation between local request-preparation failures and upstream integration failures, strict nested upstream schemas, lazy vendor pagination, empty-page handling, cycle detection, non-monotonic pagination support, semantic vendor-data validation, fail-fast page consistency, explicit upstream-to-public mapping, separate upstream and public enums, deterministic contract normalization, unsupported-contract mapping detection, stable mapping-error translation, a paginated `GET /vendor/items?page=N` API contract, FastAPI request-query validation, stable public integration error responses including retry-budget exhaustion as HTTP `504`, OpenAPI documentation, isolated API tests through dependency overrides, deterministic retry tests, collaboration tests across `VendorClient`, `RetryPolicy`, and `RateLimiter`, optional process-local client-side rate limiting through a thread-safe token bucket, a structural `RateLimiter` contract with no-op and token-bucket implementations, per-retry-attempt capacity acquisition, deterministic monotonic-clock refill behavior, concurrent acquisition coverage, and a GitHub Actions CI pipeline that verifies formatting, linting, tests, coverage, and test reports.
 
-Retries are currently applied only to the vendor client's read operation. The project intentionally does not assume that future mutating operations are safe to retry merely because a failure is transient. Safe retries for future `POST`, `PUT`, or `DELETE` operations will require operation-specific semantics, provider guarantees, or mechanisms such as idempotency keys.
+Retries are currently applied automatically only to the vendor client's read operation.
 
-The current suite contains 168 passing tests.
+Generic POST requests support idempotency keys and stable payload snapshots but intentionally perform one physical attempt.
+
+The project explicitly treats:
+
+```text
+POST + Idempotency-Key
+≠
+automatic retry
+```
+
+An idempotency key provides operation identity, but retry safety depends on the documented semantics of the specific provider operation.
+
+The retry engine now also separates:
+
+```text
+transient failure classification
+≠
+operation-specific retry eligibility
+```
+
+The default eligibility predicate preserves the existing GET behavior by accepting every `TransientIntegrationError`.
+
+Future mutating operations may use a stricter predicate and a dedicated retry policy only when their provider contract explicitly guarantees safe replay with the same idempotency key and request payload.
+
+The project therefore still does not claim that any concrete mutating provider operation is currently retry-safe.
+
+The current suite contains 189 passing tests.

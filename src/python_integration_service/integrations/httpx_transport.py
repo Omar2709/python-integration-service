@@ -1,4 +1,5 @@
-from collections.abc import Callable
+import json
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from types import TracebackType
@@ -90,8 +91,44 @@ class HttpxTransport(Transport):
         self._client.close()
 
     def get(self, url: str) -> dict:
+        return self._request(
+            method="GET",
+            url=url,
+        )
+
+    def post(
+        self,
+        url: str,
+        payload: Mapping[str, object],
+        headers: Mapping[str, str] | None = None,
+    ) -> dict:
         try:
-            response = self._client.get(url)
+            json.dumps(payload)
+        except TypeError as exc:
+            raise ValueError("Request payload must be JSON serializable") from exc
+
+        return self._request(
+            method="POST",
+            url=url,
+            json_payload=payload,
+            headers=headers,
+        )
+
+    def _request(
+        self,
+        method: Literal["GET", "POST"],
+        url: str,
+        *,
+        json_payload: Mapping[str, object] | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> dict:
+        try:
+            response = self._client.request(
+                method,
+                url,
+                json=json_payload,
+                headers=headers,
+            )
             response.raise_for_status()
 
         except httpx.TimeoutException as exc:
